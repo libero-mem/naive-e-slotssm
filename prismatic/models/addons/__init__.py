@@ -1,0 +1,1 @@
+from .slot_attention import SlotAttention
