@@ -3237,7 +3237,8 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
         texts, 
         texts_attn,
         output,
-        redundant_steps=0
+        redundant_steps=0,
+        nohead=False,
     ):
 
         # slots: [B, T, N, D]
@@ -3256,6 +3257,10 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
             )
         slots = slots + self.object_centric_pre_ssm_fusion([slots, subgoals])
         latent_slots, attention, slot_lists = self.object_centric_ssm(slots, patch_features, texts, texts_attn, output_attentions=False)
+        output['latent_slots'] = latent_slots
+        if nohead:
+            return output
+
         slots = self.object_centric_latent_decoder(torch.cat([latent_slots, slots], dim=-1))
         B, T, N, D_x_horizon_steps = slots.shape
         D = D_x_horizon_steps // (self.backward_steps + self.forward_steps)
@@ -3266,9 +3271,216 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
         nxt_masks = nxt_masks.reshape([B, T, N, *nxt_masks.shape[2:]])
         # print(slots.shape, torch.min(slots), torch.max(slots))
 
-        output['latent_slots'] = latent_slots
         output['nxt_tokens'] = slots.reshape(B, T, N, self.backward_steps + self.forward_steps, D)
         output['nxt_bboxes'] = nxt_bboxes
         output['nxt_masks'] = nxt_masks
 
         return output
+
+
+class EmbodiedDecodedSlotSSM(OpenVLAForActionPrediction_SlotSSM):
+    """Stage-3 SlotSSM model with a continuous action decoder.
+
+    The object tokenizer and temporal dynamics are inherited from
+    :class:`OpenVLAForActionPrediction_SlotSSM`, so Stage-2 checkpoints load
+    without renaming keys.  The modules defined here are new Stage-3 modules.
+    The forward contract is deliberately explicit: one five-action chunk is
+    predicted for every input horizon step.
+    """
+
+    def __init__(
+        self,
+        config: ObjectCentricVLAConfig = None,
+        base_model: OpenVLAForActionPrediction = None,
+        number_of_slots: int = 16,
+        backward_step: int = 25,
+        forward_step: int = 6,
+    ) -> None:
+        super().__init__(
+            config=config,
+            base_model=base_model,
+            number_of_slots=number_of_slots,
+            backward_step=backward_step,
+            forward_step=forward_step,
+        )
+
+        # Fuse the observed slot, the causal SlotSSM state, and the matched
+        # per-slot interaction/subgoal embedding.
+        self.object_centric_action_slot_fusion = SlotFusion(
+            input_dims=[512, 512, 512],
+            embed_dims=[512, 512, 512],
+            output_dim=512,
+        )
+        self.object_centric_action_slot_projector = PrismaticProjector(
+            use_fused_vision_backbone=False,
+            vision_dim=512,
+            llm_dim=4096,
+        )
+        self.object_centric_action_text_projector = PrismaticProjector(
+            use_fused_vision_backbone=False,
+            vision_dim=512,
+            llm_dim=4096,
+        )
+        self.object_centric_action_head = L1RegressionActionHead(
+            input_dim=4096,
+            hidden_dim=4096,
+            action_dim=ACTION_DIM,
+        )
+
+    def get_slot_fusion(
+        self,
+        current_slots: torch.Tensor,
+        latent_slots: torch.Tensor,
+        subgoal_states: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_shape = current_slots.shape
+        if latent_slots.shape != expected_shape or subgoal_states.shape != expected_shape:
+            raise ValueError(
+                "Stage-3 slot fusion inputs must have identical [B, T, N, D] shapes; "
+                f"got current={tuple(current_slots.shape)}, "
+                f"latent={tuple(latent_slots.shape)}, "
+                f"subgoals={tuple(subgoal_states.shape)}"
+            )
+        return self.object_centric_action_slot_fusion(
+            [current_slots, latent_slots, subgoal_states]
+        )
+
+    def decode_continuous_actions(
+        self,
+        slotted_features: torch.Tensor,
+        clip_embeddings: torch.Tensor,
+        clip_attention_mask: torch.Tensor,
+        llama_input_ids: torch.LongTensor,
+        llama_attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return normalized continuous actions with shape ``[B, T, 5, 7]``."""
+        if slotted_features.ndim != 4:
+            raise ValueError(
+                "slotted_features must have shape [B, T, N, D], "
+                f"got {tuple(slotted_features.shape)}"
+            )
+        batch_size, horizon, _, _ = slotted_features.shape
+        if llama_input_ids.ndim != 2 or llama_input_ids.shape[0] != batch_size:
+            raise ValueError(
+                "llama_input_ids must have shape [B, L] and share the slot batch size; "
+                f"got {tuple(llama_input_ids.shape)} for B={batch_size}"
+            )
+
+        slot_embeddings = self.object_centric_action_slot_projector(
+            rearrange(slotted_features, "b t n d -> (b t) n d")
+        )
+        text_embeddings = self.object_centric_action_text_projector(
+            rearrange(clip_embeddings, "b t l d -> (b t) l d")
+        )
+        text_attention_mask = rearrange(
+            clip_attention_mask, "b t l -> (b t) l"
+        )
+
+        # The text prompt is shared across the horizon, while every timestep
+        # receives its own object/dynamics features.
+        prompt_ids = (
+            llama_input_ids[:, None, :]
+            .expand(-1, horizon, -1)
+            .reshape(batch_size * horizon, -1)
+        )
+        prompt_attention_mask = (
+            llama_attention_mask[:, None, :]
+            .expand(-1, horizon, -1)
+            .reshape(batch_size * horizon, -1)
+        )
+        prompt_embeddings = self.base_model.get_input_embeddings()(prompt_ids)
+        slot_attention_mask = torch.ones(
+            slot_embeddings.shape[:2],
+            dtype=prompt_attention_mask.dtype,
+            device=prompt_attention_mask.device,
+        )
+
+        multimodal_embeddings = torch.cat(
+            [
+                prompt_embeddings[:, :1],
+                slot_embeddings,
+                text_embeddings,
+                prompt_embeddings[:, 1:],
+            ],
+            dim=1,
+        )
+        multimodal_attention_mask = torch.cat(
+            [
+                prompt_attention_mask[:, :1],
+                slot_attention_mask,
+                text_attention_mask.to(prompt_attention_mask.dtype),
+                prompt_attention_mask[:, 1:],
+            ],
+            dim=1,
+        )
+
+        language_model = self.base_model.language_model
+        if not hasattr(language_model, "model"):
+            raise TypeError(
+                "Stage-3 continuous decoding expects a HuggingFace causal LM "
+                "with a `.model` backbone"
+            )
+        language_model_output = language_model.model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            inputs_embeds=multimodal_embeddings,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        last_hidden_states = language_model_output.last_hidden_state
+        action_token_count = NUM_ACTIONS_CHUNK * ACTION_DIM
+        if last_hidden_states.shape[1] < action_token_count + 1:
+            raise RuntimeError(
+                "The action prompt is too short for the continuous action head: "
+                f"sequence length {last_hidden_states.shape[1]}, "
+                f"required at least {action_token_count + 1}"
+            )
+        action_hidden_states = last_hidden_states[
+            :, -1 - action_token_count : -1
+        ]
+        actions = self.object_centric_action_head.predict_action(
+            action_hidden_states
+        )
+        return actions.reshape(
+            batch_size, horizon, NUM_ACTIONS_CHUNK, ACTION_DIM
+        )
+
+    def forward(
+        self,
+        object_outputs: Dict[str, torch.Tensor],
+        subgoal_states: torch.Tensor,
+        llama_input_ids: torch.LongTensor,
+        llama_attention_mask: torch.Tensor,
+        action_start_step: int = 0,
+    ) -> torch.Tensor:
+        outputs = self.get_slot_dynamics(
+            object_outputs["visual_tokens"],
+            subgoal_states,
+            object_outputs["patch_features"],
+            object_outputs["texts"],
+            object_outputs["texts_attn"],
+            object_outputs,
+            redundant_steps=0,
+            nohead=True,
+        )
+        slotted_features = self.get_slot_fusion(
+            outputs["visual_tokens"],
+            outputs["latent_slots"],
+            subgoal_states,
+        )
+        if not 0 <= action_start_step < slotted_features.shape[1]:
+            raise ValueError(
+                "action_start_step must select at least one horizon position; "
+                f"got {action_start_step} for horizon {slotted_features.shape[1]}"
+            )
+        return self.decode_continuous_actions(
+            slotted_features=slotted_features[:, action_start_step:],
+            clip_embeddings=outputs["texts"][:, action_start_step:],
+            clip_attention_mask=torch.logical_not(
+                outputs["texts_attn"][:, action_start_step:]
+            ),
+            llama_input_ids=llama_input_ids,
+            llama_attention_mask=llama_attention_mask,
+        )

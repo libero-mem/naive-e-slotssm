@@ -38,6 +38,8 @@ Single-GPU:
         --dataset_name "droid_wipe" \
         --run_root_dir "/path/to/checkpoints" \
         --adapter_tmp_dir "/path/to/adapters" \
+        --load_slot_path "/path/to/object_centric_bwd25_fwd6.safetensors" \
+        --interaction_cache_path "/path/to/cnt_text_embeddings.pt" \
         --batch_size 16 \
         --horizon_size 32 \
         --bwd_steps 25 \
@@ -58,6 +60,8 @@ Multi-GPU:
         --vla_path "openvla/openvla-7b" \
         --data_root_dir "/path/to/datasets" \
         --dataset_name "droid_wipe" \
+        --load_slot_path "/path/to/object_centric_bwd25_fwd6.safetensors" \
+        --interaction_cache_path "/path/to/cnt_text_embeddings.pt" \
         --batch_size 16 \
         --horizon_size 32 \
         --bwd_steps 25 \
@@ -91,6 +95,7 @@ import gc
 import os
 import sys
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -254,7 +259,8 @@ class FinetuneConfig:
     dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     adapter_tmp_dir: Path = Path("vla-scripts/tmp")                     # Temporary directory for LoRA weights before fusing
-    load_slot_path: Path = Path("tmp")
+    load_slot_path: Optional[Path] = None                            # Stage-2 SlotSSM checkpoint
+    interaction_cache_path: Path = Path("cnt_text_embeddings.pt")    # Cached interaction-text embeddings
 
     # Fine-tuning Parameters
     batch_size: int = 16                                            # Fine-tuning batch size
@@ -288,9 +294,15 @@ class FinetuneConfig:
     modality_key: str = "1000"     # Binary characters for using RGB main, RGB wrist, depth main, depth wrist
     resume: bool = False                                           # Whether to resume old run
     debug: bool = False                                           # Whether to use debug mode
+    train_rotation: bool = False                                  # Include xyz rotation dimensions in the action loss
+    action_loss_start_step: int = 16                              # Ignore early horizon steps with little temporal context
 
 MODALITIES = ['rgb_main', 'rgb_wrist', 'depth_main', 'depth_wrist']
 def process_modality_key(modality_key):
+    if len(modality_key) != len(MODALITIES) or any(bit not in "01" for bit in modality_key):
+        raise ValueError(
+            f"modality_key must contain four binary digits, got {modality_key!r}"
+        )
     modality_flags = {}
     modality_num = 0
     for i, modal in enumerate(MODALITIES):
@@ -334,12 +346,21 @@ def get_slot_specific_subgoals(
         all_obj_itrn_cnts,
         cnt_embedding_table,
         object_loss,
-        object_centric_text_encoder=None,
+        object_centric_text_encoder,
+        cache_path: Path,
     ):
     bz = outputs['visual_tokens'].shape[0]
+    device = outputs["visual_tokens"].device
+    new_key = False
+    if "0" not in cnt_embedding_table:
+        cnt_embedding_table["0"] = (
+            object_centric_text_encoder.encode_simple(["0"], device)
+            .detach()
+            .reshape(-1)
+        )
+        new_key = True
     # Get the object interaction count embeddings
     all_obj_itrn_cnts_mapped = []
-    new_key = False
     for b in range(bz):
         batched_subgoal_encodings = []
         for obj_itrn in all_obj_itrn_cnts[b]:
@@ -347,11 +368,15 @@ def get_slot_specific_subgoals(
             for key in obj_itrn:
                 if key not in cnt_embedding_table:
                     new_key = True
-                    obj_subgoal_encodings = object_centric_text_encoder.encode_simple([key], outputs['visual_tokens'].device)
+                    obj_subgoal_encodings = (
+                        object_centric_text_encoder.encode_simple([key], device)
+                        .detach()
+                        .reshape(-1)
+                    )
                     cnt_embedding_table[key] = obj_subgoal_encodings
                 else:
-                    obj_subgoal_encodings = cnt_embedding_table[key]
-                obj_subgoals.append(obj_subgoal_encodings.squeeze())
+                    obj_subgoal_encodings = cnt_embedding_table[key].reshape(-1)
+                obj_subgoals.append(obj_subgoal_encodings)
 
             batched_subgoal_encodings.append(torch.stack(obj_subgoals))
 
@@ -359,8 +384,12 @@ def get_slot_specific_subgoals(
         # Output shape will be [B, H, W, encoded_dim]
         all_obj_itrn_cnts_mapped.append(obj_itrn_cnts_mapped)
 
-    if new_key:
-        torch.save(cnt_embedding_table, 'cnt_text_embeddings.pt')
+    if new_key and (not dist.is_initialized() or dist.get_rank() == 0):
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {key: value.detach().cpu() for key, value in cnt_embedding_table.items()},
+            cache_path,
+        )
 
     # align the gt data with slot predictions
     object_preds = {'bboxes': outputs['bboxes'].permute(0, 2, 1, 3)}
@@ -380,7 +409,10 @@ def get_slot_specific_subgoals(
         # zero init the None's
         for s in range(object_token_num):
             if slot_specific_cnt[s] is None:
-                slot_specific_cnt[s] = torch.stack([cnt_embedding_table['0']]*horizon)
+                zero_embedding = cnt_embedding_table["0"].reshape(-1)
+                slot_specific_cnt[s] = zero_embedding.unsqueeze(0).expand(
+                    horizon, -1
+                )
 
         # slot cnts
         slot_specific_cnt = torch.stack(slot_specific_cnt)
@@ -400,6 +432,50 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
+    if cfg.grad_accumulation_steps < 1:
+        raise ValueError("grad_accumulation_steps must be at least 1")
+    if cfg.max_steps < 1 or cfg.save_steps < 1:
+        raise ValueError("max_steps and save_steps must be at least 1")
+    if cfg.horizon_size != cfg.bwd_steps + cfg.fwd_steps + 1:
+        raise ValueError(
+            "horizon_size must equal bwd_steps + fwd_steps + 1; "
+            f"got {cfg.horizon_size} != {cfg.bwd_steps} + {cfg.fwd_steps} + 1"
+        )
+    if not 0 <= cfg.action_loss_start_step < cfg.horizon_size:
+        raise ValueError(
+            "action_loss_start_step must be within the horizon; "
+            f"got {cfg.action_loss_start_step} for horizon {cfg.horizon_size}"
+        )
+    if cfg.resume:
+        raise NotImplementedError(
+            "--resume is not implemented for Stage 3; start a new run or "
+            "load a Stage-3 checkpoint explicitly after adding optimizer-state support"
+        )
+    if cfg.use_quantization:
+        raise NotImplementedError(
+            "Stage-3 4-bit training is not supported yet because the newly "
+            "constructed action modules require explicit mixed device placement"
+        )
+    modality_flags, _ = process_modality_key(cfg.modality_key)
+    if not modality_flags["rgb_main"] or any(
+        modality_flags[name] for name in ("rgb_wrist", "depth_main", "depth_wrist")
+    ):
+        raise ValueError(
+            "The current SlotSSM tokenizer supports primary RGB only; "
+            "use --modality_key 1000"
+        )
+    if cfg.load_slot_path is None:
+        raise ValueError(
+            "Stage 3 requires --load_slot_path pointing to the Stage-2 "
+            "object_centric_bwd*_fwd*.safetensors checkpoint"
+        )
+    if not cfg.load_slot_path.is_file():
+        raise FileNotFoundError(f"Stage-2 checkpoint not found: {cfg.load_slot_path}")
+    if not cfg.interaction_cache_path.is_file():
+        raise FileNotFoundError(
+            f"Interaction embedding cache not found: {cfg.interaction_cache_path}"
+        )
+
     distributed_state = PartialState()
     torch.cuda.set_device(device_id := distributed_state.local_process_index)
     torch.cuda.empty_cache()
@@ -407,7 +483,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Configure Unique Experiment ID & Log Directory
     exp_id = (
         f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
-        f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
+        f"+b{cfg.batch_size * cfg.grad_accumulation_steps * distributed_state.num_processes}"
         f"+lr-{cfg.learning_rate}"
     )
     if cfg.use_lora:
@@ -459,16 +535,13 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     vla.vision_backbone.requires_grad_(False)
 
-    if cfg.use_lora:
-        if distributed_state.is_main_process:
-            # Overwrite latest checkpoint
-            vla.save_pretrained(run_dir)
-            print("saving", run_dir)
-
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
         # Get linear module names not in backbone
-        linear_module_names = get_linear_module_names(vla, exclude_pattern=['vision_backbone'])
+        linear_module_names = get_linear_module_names(
+            vla,
+            exclude_pattern=["vision_backbone", "projector"],
+        )
 
         lora_config = LoraConfig(
             r=cfg.lora_rank,
@@ -480,14 +553,56 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
-    vla = EmbodiedDecodedSlotSSM(base_model=vla, number_of_slots=cfg.number_of_slots)
-    weights = load_file('/cm/shared/weights/openvla/adapters/output_hf_model_openx+libero_mem+b8+lr-1e-05--image_aug--multiview1000/object_centric_bwd25_fwd6.safetensors')
-    del weights
-    vla.load_state_dict(weights, strict=False)
-    vla.object_centric_tokenizer.requires_grad_(False)
-    vla.object_centric_bbox_head.requires_grad_(False)
-    vla.object_centric_mask_head.requires_grad_(False)
-    vla.object_centric_ssm.requires_grad_(False)
+    vla = EmbodiedDecodedSlotSSM(
+        base_model=vla,
+        number_of_slots=cfg.number_of_slots,
+        backward_step=cfg.bwd_steps,
+        forward_step=cfg.fwd_steps,
+    )
+    slot_state_dict = load_file(str(cfg.load_slot_path), device="cpu")
+    incompatible_keys = vla.load_state_dict(slot_state_dict, strict=False)
+    required_prefixes = (
+        "object_centric_tokenizer.",
+        "object_centric_bbox_head.",
+        "object_centric_mask_head.",
+        "object_centric_pre_ssm_fusion.",
+        "object_centric_ssm.",
+        "object_centric_latent_decoder.",
+    )
+    absent_prefixes = [
+        prefix
+        for prefix in required_prefixes
+        if not any(key.startswith(prefix) for key in slot_state_dict)
+    ]
+    if absent_prefixes:
+        raise RuntimeError(
+            "The Stage-2 checkpoint is incomplete; missing tensor groups: "
+            + ", ".join(absent_prefixes)
+        )
+    if incompatible_keys.unexpected_keys:
+        raise RuntimeError(
+            "The Stage-2 checkpoint contains keys unknown to the Stage-3 model: "
+            + ", ".join(incompatible_keys.unexpected_keys[:20])
+        )
+    print(
+        f"Loaded {len(slot_state_dict)} Stage-2 tensors from {cfg.load_slot_path}"
+    )
+    del slot_state_dict
+
+    # Stage 3 treats the object tokenizer and temporal model as a frozen
+    # representation. Only newly introduced action modules and optional LoRA
+    # adapters are optimized.
+    for module in (
+        vla.object_centric_tokenizer,
+        vla.object_centric_bbox_head,
+        vla.object_centric_mask_head,
+        vla.object_centric_pre_ssm_fusion,
+        vla.object_centric_ssm,
+        vla.object_centric_latent_decoder,
+    ):
+        module.requires_grad_(False)
+    if not cfg.use_lora:
+        vla.base_model.requires_grad_(False)
 
     vla = vla.to(device_id)
 
@@ -496,6 +611,15 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters remain after Stage-3 freezing")
+    if distributed_state.is_main_process:
+        trainable_count = sum(parameter.numel() for parameter in trainable_params)
+        total_count = sum(parameter.numel() for parameter in vla.parameters())
+        print(
+            f"Stage-3 trainable parameters: {trainable_count:,} / "
+            f"{total_count:,} ({100 * trainable_count / total_count:.3f}%)"
+        )
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Create Action Tokenizer
@@ -541,8 +665,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         image_aug=cfg.image_aug,
         window_size=window_size,
         future_action_window_size=5,
-        load_camera_views=("primary", "wrist"),
-        load_depth=True,
+        load_camera_views=("primary",),
+        load_depth=False,
         cropping=False
     )
     
@@ -565,230 +689,217 @@ def finetune(cfg: FinetuneConfig) -> None:
     #                config={"_service_wait": 120})
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
-    recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Train!
-    chosen_data = None
-    final_save = False
-    modality_flags, modality_num = process_modality_key(cfg.modality_key)
     object_loss = RobotSSMObjectLossWithTrack()
-    cnt_embedding_table = torch.load('cnt_text_embeddings.pt')
+    cnt_embedding_table = torch.load(
+        cfg.interaction_cache_path,
+        map_location="cpu",
+    )
     for key, value in cnt_embedding_table.items():
-        cnt_embedding_table[key] = value.to(device_id)
+        cnt_embedding_table[key] = value.reshape(-1).to(device_id)
     gc.collect()
     torch.cuda.empty_cache()
-    mask_feat = None
+    action_dimension_mask = torch.tensor(
+        [1, 1, 1, 1, 1, 1, 1]
+        if cfg.train_rotation
+        else [1, 1, 1, 0, 0, 0, 1],
+        dtype=torch.float32,
+        device=device_id,
+    ).view(1, 1, 1, 7)
+    completed_steps = 0
+
+    def save_checkpoint(step: int) -> None:
+        if not distributed_state.is_main_process:
+            return
+        processor.save_pretrained(adapter_dir)
+        if cfg.use_lora:
+            vla.module.base_model.save_pretrained(adapter_dir)
+        object_centric_state_dict = {
+            key: value.detach().contiguous()
+            for key, value in vla.module.state_dict().items()
+            if key.startswith("object_centric_")
+        }
+        suffix = "" if cfg.save_latest_checkpoint_only else f"_step{step}"
+        checkpoint_path = (
+            adapter_dir
+            / (
+                f"object_centric_bwd{cfg.bwd_steps}_fwd{cfg.fwd_steps}"
+                f"_actionable{suffix}.safetensors"
+            )
+        )
+        save_file(object_centric_state_dict, str(checkpoint_path))
+        print(f"Saved Stage-3 checkpoint for step {step} at {checkpoint_path}")
+
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
+        for frozen_module in (
+            vla.module.base_model.vision_backbone,
+            vla.module.object_centric_tokenizer,
+            vla.module.object_centric_bbox_head,
+            vla.module.object_centric_mask_head,
+            vla.module.object_centric_pre_ssm_fusion,
+            vla.module.object_centric_ssm,
+            vla.module.object_centric_latent_decoder,
+        ):
+            frozen_module.eval()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
-
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-               
-                pixel_values = batch["all_pixel_values"].to(torch.bfloat16).to(device_id)
-
-                reasoning_on_image=batch["reasoning_on_image"]
-                # print(reasoning_on_image); 1/0
-                all_interaction_cnts = process_interactions(reasoning_on_image) # [B x H] lists of dicts of interactions
-                all_seg_ids = process_seg_ids(reasoning_on_image)               # [B x H] lists of dicts of seg ids
-                all_bboxes = process_bboxes(reasoning_on_image)                 # [B x H] lists of dicts of bboxes [cx cy w h, obj] in [0,1]
-
-                # all_images = denormalize_from_DINO(batch["all_pixel_values"][:,:,:3,:,:]).to(device_id)    
-                all_obj_keys = [list(all_bboxes[b].keys()) for b in range(len(all_bboxes))]
-                all_obj_bboxes = [[horizon_bboxes[key] for key in all_obj_keys[i]] for i,horizon_bboxes in enumerate(all_bboxes)]    # [B x O x H x 5]
-                all_obj_segids = [[horizon_seg_ids[key] for key in all_obj_keys[i]] for i,horizon_seg_ids in enumerate(all_seg_ids)] # [B x O x H]
-                all_obj_itrn_cnts = [[horizon_itrn_cnts[key] for key in all_obj_keys[i]] for i,horizon_itrn_cnts in enumerate(all_interaction_cnts)] # [B x O x H]
-
-                # interaction wgrip
-                all_interaction_cnts_wgrip = process_interactions(reasoning_on_image)
-                all_obj_itrn_cnts_wgrip = [[horizon_itrn_cnts[key] for key in all_obj_keys[i]] for i,horizon_itrn_cnts in enumerate(all_interaction_cnts_wgrip)] # [B x O x H]
-
-                all_pixel_seg_values = batch["all_pixel_seg_values"]
-                bz, horizon, H, W = all_pixel_seg_values.shape
-                # downsampling the seg values
-                all_pixel_seg_values = all_pixel_seg_values.reshape(bz*horizon, 1, H, W)
-                all_pixel_seg_values = torch.nn.functional.interpolate(all_pixel_seg_values, size=(64, 64))
-                all_pixel_seg_values = all_pixel_seg_values.reshape(bz, horizon, 64, 64)
-                object_gts = object_loss.preprocess(
-                    all_obj_bboxes,
-                    all_obj_segids, all_pixel_seg_values,
-                    all_obj_itrn_cnts
-                )
-
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    # # sample values
-                    # num_objs = 8
-                    # pred_bboxes = torch.rand(cfg.batch_size, window_size, num_objs, 5)
-                    # pred_segs = torch.rand(cfg.batch_size, window_size, num_objs, 224, 224)
-                    # print('sample_pred_bboxes', pred_bboxes.shape)
-                    # print('sample_pred_segs', pred_segs.shape)
-                    # pred_bboxes = pred_bboxes.permute(0, 2, 1, 3)
-                    # pred_segs = pred_segs.permute(0, 2, 1, 3, 4)
-                    texts = ['robot ' + batch['tasks'][b]['instruction'] for b in range(cfg.batch_size)]
-                    outputs = vla.module.get_obj_slots(pixel_values, texts)
-
-                    ############################################
-                    subgoal_states, indices = get_slot_specific_subgoals(
-                        outputs,
-                        vla.module.object_token_num, horizon,
-                        object_gts,
-                        all_obj_itrn_cnts,
-                        cnt_embedding_table,
-                        object_loss,
-                        vla.module.object_centric_text_encoder
-                    )
-                    original_slots = outputs['visual_tokens']
-
-                    # can filter temporally of the next slots
-                    outputs = vla.module.get_slot_dynamics(
-                        original_slots,
-                        subgoal_states,
-                        outputs['patch_features'], 
-                        outputs['texts'], 
-                        outputs['texts_attn'],
-                        outputs,
-                        redundant_steps=0,
-                        nohead=True
-                    )
-
-                    # get object-centric dynamics
-                    crn_slots = outputs['visual_tokens'] # [b, t, o, d]
-                    nxt_slots = outputs['latent_slots']    # [b, t, o, d]
-
-                    patch_features = outputs['patch_features']
-                    slotted_features = vla.module.get_slot_fusion(crn_slots, nxt_slots, subgoal_states)
-                    clip_embeddings = outputs['texts']
-                    clip_attention_mask = torch.logical_not(outputs['texts_attn'])
-
-                    llama_input_ids = batch["input_ids"].to(device_id)
-                    llama_attention_mask = batch["attention_mask"].to(device_id)
-                    llama_labels = batch["labels"]
-
-                    continuous_actions_pred = vla.module.decode_continuous_actions(
-                        patch_features=patch_features,
-                        slotted_features=slotted_features,
-                        clip_embeddings=clip_embeddings,
-                        clip_attention_mask=clip_attention_mask,
-                        llama_input_ids=llama_input_ids,
-                        llama_attention_mask=llama_attention_mask,
-                        llama_labels=llama_labels
-                    ) # will return output of [cross-modality-slots, cross-modality-bboxes]
-                    action_chunk, action_dim = continuous_actions_pred.shape[1:]
-
-            # Compute Accuracy and L1 Loss for Logging
-            action_gt = batch["labels"][:, :, 1:].to(device_id)
-            action_gt = action_gt[:, 16:] # skip a few first time steps
-            action_gt = action_gt[:,:,-1-(action_dim*action_chunk):-1]
-            continuous_actions_pred = continuous_actions_pred.reshape(bz, horizon, -1)
-            continuous_actions_pred = continuous_actions_pred[:, 16:] # skip a few first time steps
-
-            # Compute L1 Loss on Predicted (Continuous) Actions
-            continuous_actions_gt = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_gt.cpu().numpy())
+            pixel_values = batch["all_pixel_values"].to(
+                device=device_id, dtype=torch.bfloat16
             )
-            continuous_actions_gt = continuous_actions_gt.to(device_id)
+            reasoning_on_image = batch["reasoning_on_image"]
+            all_interaction_cnts = process_interactions(reasoning_on_image)
+            all_seg_ids = process_seg_ids(reasoning_on_image)
+            all_bboxes = process_bboxes(reasoning_on_image)
+            all_obj_keys = [
+                list(sample_bboxes.keys()) for sample_bboxes in all_bboxes
+            ]
+            all_obj_bboxes = [
+                [sample_bboxes[key] for key in all_obj_keys[index]]
+                for index, sample_bboxes in enumerate(all_bboxes)
+            ]
+            all_obj_segids = [
+                [sample_seg_ids[key] for key in all_obj_keys[index]]
+                for index, sample_seg_ids in enumerate(all_seg_ids)
+            ]
+            all_obj_itrn_cnts = [
+                [sample_interactions[key] for key in all_obj_keys[index]]
+                for index, sample_interactions in enumerate(all_interaction_cnts)
+            ]
 
-            B, T, F = continuous_actions_pred.shape  # [1, 59, 35]
-            if mask_feat is None:
-                pattern = torch.tensor([1, 1, 1, 0, 0, 0, 1], dtype=torch.float32).to(device_id) # no rotations
-                mask_feat = pattern.repeat(F // 7)   # [35]
-                mask_feat = mask_feat.unsqueeze(0).unsqueeze(0)
+            all_pixel_seg_values = batch["all_pixel_seg_values"]
+            batch_size, horizon, height, width = all_pixel_seg_values.shape
+            all_pixel_seg_values = F.interpolate(
+                all_pixel_seg_values.reshape(
+                    batch_size * horizon, 1, height, width
+                ).float(),
+                size=(64, 64),
+                mode="nearest",
+            ).reshape(batch_size, horizon, 64, 64)
+            object_gts = object_loss.preprocess(
+                all_obj_bboxes,
+                all_obj_segids,
+                all_pixel_seg_values,
+                all_obj_itrn_cnts,
+            )
 
-            # Apply mask
-            masked_pred = continuous_actions_pred * mask_feat
-            masked_gt   = continuous_actions_gt * mask_feat
-
-            action_l1_loss = torch.nn.functional.l1_loss(masked_pred.squeeze(), 
-                                                         masked_gt.squeeze(),
-                                                         reduction='sum') / mask_feat.sum() / T / B
-
-            # Normalize loss to account for gradient accumulation
-            normalized_loss = action_l1_loss / cfg.grad_accumulation_steps
-
-            # Backward pass
-            normalized_loss.backward()
-
-            # Store recent train metrics
-            # recent_losses.append(loss.item())
-            recent_l1_losses.append(action_l1_loss.item())
-
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
-            # Compute smoothened train metrics
-            #   =>> Equal to current step metrics when not using gradient accumulation
-            #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
-            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
-
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
-            # Push Metrics to W&B (every 10 gradient steps)
-            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                data_log = {
-                    "l1_loss": smoothened_l1_loss,
+            # The Stage-1 object tokenizer is frozen. Run it outside the DDP
+            # forward and retain only its values for matching and Stage-3.
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                texts = [
+                    "robot " + task["instruction"] for task in batch["tasks"]
+                ]
+                object_outputs = vla.module.get_obj_slots(pixel_values, texts)
+                subgoal_states, _ = get_slot_specific_subgoals(
+                    object_outputs,
+                    vla.module.object_token_num,
+                    horizon,
+                    object_gts,
+                    all_obj_itrn_cnts,
+                    cnt_embedding_table,
+                    object_loss,
+                    vla.module.object_centric_text_encoder,
+                    cfg.interaction_cache_path,
+                )
+                object_outputs = {
+                    key: object_outputs[key]
+                    for key in (
+                        "visual_tokens",
+                        "patch_features",
+                        "texts",
+                        "texts_attn",
+                    )
                 }
 
-                if smoothened_l1_loss > 0.1:
-                    all_images = denormalize_from_DINO(batch["all_pixel_values"][:,:,:3,:,:]).to(device_id)    
-                    all_obj_itrn_cnts = all_obj_itrn_cnts
-                    object_preds = {'bboxes': outputs['bboxes'].permute(0, 2, 1, 3)}
-                    object_gts = object_gts
-                    indices = indices
-                    
-                    continuous_actions_pred = continuous_actions_pred.squeeze()
-                    continuous_actions_gt = continuous_actions_gt.squeeze()
+            input_ids = batch["input_ids"].to(device_id)
+            attention_mask = batch["attention_mask"].to(device_id)
+            is_optimizer_step = (
+                (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+            )
+            sync_context = nullcontext() if is_optimizer_step else vla.no_sync()
+            with sync_context:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    continuous_actions_pred = vla(
+                        object_outputs=object_outputs,
+                        subgoal_states=subgoal_states,
+                        llama_input_ids=input_ids,
+                        llama_attention_mask=attention_mask,
+                        action_start_step=cfg.action_loss_start_step,
+                    )
 
-                    # Pack everything in a dict
-                    data_to_save = {
-                        "all_images": all_images,
-                        "all_obj_itrn_cnts": all_obj_itrn_cnts,
-                        "object_preds": object_preds,
-                        "object_gts": object_gts,
-                        "indices": indices,
-                        "continuous_actions_pred": continuous_actions_pred,
-                        "continuous_actions_gt": continuous_actions_gt,
-                    }
+                    loss_horizon = horizon - cfg.action_loss_start_step
+                    expected_shape = (batch_size, loss_horizon, 5, 7)
+                    if continuous_actions_pred.shape != expected_shape:
+                        raise RuntimeError(
+                            "Stage-3 action decoder violated its output contract: "
+                            f"got {tuple(continuous_actions_pred.shape)}, "
+                            f"expected {expected_shape}"
+                        )
 
-                    # Save
-                    torch.save(data_to_save, "debug_snapshot.pt")
+                    action_token_count = 5 * 7
+                    action_token_ids = batch["labels"][
+                        :, :, -1 - action_token_count : -1
+                    ]
+                    if (action_token_ids < 0).any():
+                        raise RuntimeError(
+                            "Action target slice contains padding/ignore tokens; "
+                            "check RLDSBatchTransformV3_1 prompt construction"
+                        )
+                    continuous_actions_gt = torch.as_tensor(
+                        action_tokenizer.decode_token_ids_to_actions(
+                            action_token_ids.cpu().numpy()
+                        ),
+                        device=device_id,
+                        dtype=continuous_actions_pred.dtype,
+                    ).reshape(batch_size, horizon, 5, 7)[
+                        :, cfg.action_loss_start_step :
+                    ]
 
-                # wandb.log(
-                #     data_log,
-                #     step=gradient_step_idx,
-                # )
-                print(data_log)
+                    absolute_error = (
+                        continuous_actions_pred - continuous_actions_gt
+                    ).abs() * action_dimension_mask
+                    denominator = (
+                        continuous_actions_pred.shape[0]
+                        * continuous_actions_pred.shape[1]
+                        * continuous_actions_pred.shape[2]
+                        * action_dimension_mask.sum()
+                    )
+                    action_l1_loss = absolute_error.sum() / denominator
+                    normalized_loss = (
+                        action_l1_loss / cfg.grad_accumulation_steps
+                    )
+                normalized_loss.backward()
 
-            # Optimizer Step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            recent_l1_losses.append(action_l1_loss.item())
+            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
+
+            if is_optimizer_step:
                 optimizer.step()
                 optimizer.zero_grad()
+                completed_steps += 1
                 progress.update()
+                if distributed_state.is_main_process and completed_steps % 10 == 0:
+                    progress.write(
+                        str(
+                            {
+                                "step": completed_steps,
+                                "l1_loss": round(smoothened_l1_loss, 6),
+                            }
+                        )
+                    )
 
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if (gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0):
+                should_save = (
+                    completed_steps % cfg.save_steps == 0
+                    or completed_steps >= cfg.max_steps
+                )
+                if should_save:
+                    save_checkpoint(completed_steps)
+                    distributed_state.wait_for_everyone()
 
-                if distributed_state.is_main_process:
-                    # if not final_save:
-
-                    # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    try:
-                        # Save Processor & Weights
-                        processor.save_pretrained(adapter_dir)
-                        vla.module.base_model.save_pretrained(adapter_dir)
-
-                        merged_state_dict = vla.module.state_dict()
-                        object_centric_state_dict = {k: v for k, v in merged_state_dict.items() if 'object_centric' in k}
-                        save_file(object_centric_state_dict, str(adapter_dir) + f"/object_centric_bwd{cfg.bwd_steps}+fwd{cfg.fwd_steps}_actionable.safetensors")
-                        print(f"Saving Model Checkpoint for Step {gradient_step_idx}", adapter_dir)
-
-                    except:
-                        pass
-
-                # Wait for processor and adapter weights to be saved by main process
-                dist.barrier()
+                if completed_steps >= cfg.max_steps:
+                    break
 
 
 if __name__ == "__main__":
