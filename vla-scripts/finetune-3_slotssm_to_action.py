@@ -105,7 +105,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import tqdm
 import wandb
 from accelerate import PartialState
@@ -682,7 +681,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     vla = vla.to(device_id)
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
-    vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    vla = DDP(
+        vla,
+        device_ids=[device_id],
+        find_unused_parameters=True,
+        gradient_as_bucket_view=True,
+        static_graph=True,
+    )
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -737,6 +742,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        include_segmentation=False,
     )
     vla_dataset = RLDSDatasetV3_1(
         cfg.data_root_dir,
@@ -764,6 +770,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         sampler=None,
         collate_fn=collator,
         num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+        pin_memory=True,
     )
 
     wandb_run = None
@@ -876,11 +883,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             pixel_values = batch["all_pixel_values"].to(
-                device=device_id, dtype=torch.bfloat16
+                device=device_id,
+                dtype=torch.bfloat16,
+                non_blocking=True,
             )
             reasoning_on_image = batch["reasoning_on_image"]
             all_interaction_cnts = process_interactions(reasoning_on_image)
-            all_seg_ids = process_seg_ids(reasoning_on_image)
             all_bboxes = process_bboxes(reasoning_on_image)
             all_obj_keys = [
                 list(sample_bboxes.keys()) for sample_bboxes in all_bboxes
@@ -889,29 +897,18 @@ def finetune(cfg: FinetuneConfig) -> None:
                 [sample_bboxes[key] for key in all_obj_keys[index]]
                 for index, sample_bboxes in enumerate(all_bboxes)
             ]
-            all_obj_segids = [
-                [sample_seg_ids[key] for key in all_obj_keys[index]]
-                for index, sample_seg_ids in enumerate(all_seg_ids)
-            ]
             all_obj_itrn_cnts = [
                 [sample_interactions[key] for key in all_obj_keys[index]]
                 for index, sample_interactions in enumerate(all_interaction_cnts)
             ]
 
-            all_pixel_seg_values = batch["all_pixel_seg_values"]
-            batch_size, horizon, height, width = all_pixel_seg_values.shape
-            all_pixel_seg_values = F.interpolate(
-                all_pixel_seg_values.reshape(
-                    batch_size * horizon, 1, height, width
-                ).float(),
-                size=(64, 64),
-                mode="nearest",
-            ).reshape(batch_size, horizon, 64, 64)
+            batch_size, horizon = pixel_values.shape[:2]
             object_gts = object_loss.preprocess(
                 all_obj_bboxes,
-                all_obj_segids,
-                all_pixel_seg_values,
-                all_obj_itrn_cnts,
+                all_obj_segids=None,
+                all_pixel_seg_values=None,
+                all_interaction_cnts=all_obj_itrn_cnts,
+                include_segs=False,
             )
 
             # The Stage-1 object tokenizer is frozen. Run it outside the DDP
@@ -920,7 +917,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                 texts = [
                     "robot " + task["instruction"] for task in batch["tasks"]
                 ]
-                object_outputs = vla.module.get_obj_slots(pixel_values, texts)
+                object_outputs = vla.module.get_obj_slots(
+                    pixel_values,
+                    texts,
+                    batch_vision_backbone=True,
+                    compute_masks=False,
+                )
                 subgoal_states, _ = get_slot_specific_subgoals(
                     object_outputs,
                     vla.module.object_token_num,
@@ -942,8 +944,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                     )
                 }
 
-            input_ids = batch["input_ids"].to(device_id)
-            attention_mask = batch["attention_mask"].to(device_id)
+            input_ids = batch["input_ids"].to(device_id, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(
+                device_id,
+                non_blocking=True,
+            )
             is_optimizer_step = (
                 (batch_idx + 1) % cfg.grad_accumulation_steps == 0
             )

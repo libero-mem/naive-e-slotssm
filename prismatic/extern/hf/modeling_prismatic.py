@@ -3194,10 +3194,52 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
 
         return output
 
+    def get_obj_slots_from_patch_features(
+        self,
+        patch_features: torch.FloatTensor,
+        past_tokens: Optional[torch.FloatTensor] = None,
+        compute_masks: bool = True,
+    ):
+        """Run sequential slot extraction heads on precomputed vision features."""
+        if patch_features.ndim != 3:
+            raise ValueError(
+                "patch_features must have shape [B, V, D], "
+                f"got {tuple(patch_features.shape)}"
+            )
+        batch_size = patch_features.shape[0]
+        patch_features = patch_features.reshape(batch_size, -1, 2176)
+        visual_tokens, attention, _ = self.object_centric_tokenizer(
+            patch_features,
+            past_slots=past_tokens,
+        )
+        bboxes = self.object_centric_bbox_head(visual_tokens).sigmoid()
+        output = {
+            "patch_features": patch_features.reshape(
+                batch_size, 1, -1, 2176
+            ),
+            "visual_tokens": visual_tokens.reshape(
+                batch_size, 1, self.object_token_num, -1
+            ),
+            "attentions": attention.reshape(
+                batch_size, 1, self.object_token_num, -1
+            ),
+            "bboxes": bboxes.reshape(
+                batch_size, 1, self.object_token_num, 5
+            ),
+        }
+        if compute_masks:
+            masks = self.object_centric_mask_head(visual_tokens)
+            output["masks"] = masks.reshape(
+                batch_size, 1, *masks.shape[1:]
+            )
+        return output
+
     def get_obj_slots(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
         texts: Optional[list] = None,
+        batch_vision_backbone: bool = False,
+        compute_masks: bool = True,
     ):
         """ This function receives pixel values in a horizon to output the corresponding visual representations.
 
@@ -3206,11 +3248,37 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
                 else, outputs only the slots.
         """
         device = pixel_values.device
-        output = {'patch_features': [], 'visual_tokens': [], 'attentions': [], 'bboxes': [], 'masks': []}
+        output = {
+            'patch_features': [],
+            'visual_tokens': [],
+            'attentions': [],
+            'bboxes': [],
+        }
+        if compute_masks:
+            output['masks'] = []
         bz, horizon = pixel_values.shape[:2]
+        precomputed_patch_features = None
+        if batch_vision_backbone:
+            flat_pixel_values = pixel_values.reshape(
+                bz * horizon, *pixel_values.shape[2:]
+            )
+            precomputed_patch_features = self.base_model.vision_backbone(
+                flat_pixel_values
+            ).reshape(bz, horizon, -1, 2176)
+
         past_tokens=None
         for h in range(horizon):
-            suboutput = self.get_obj_slots_per_image(pixel_values[:,h], past_tokens)
+            if precomputed_patch_features is not None:
+                suboutput = self.get_obj_slots_from_patch_features(
+                    precomputed_patch_features[:, h],
+                    past_tokens=past_tokens,
+                    compute_masks=compute_masks,
+                )
+            else:
+                suboutput = self.get_obj_slots_per_image(
+                    pixel_values[:, h],
+                    past_tokens,
+                )
             if 'visual_tokens' in suboutput:
                 past_tokens = suboutput['visual_tokens'].detach()
             for key, value in suboutput.items():

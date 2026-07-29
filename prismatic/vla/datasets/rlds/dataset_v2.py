@@ -10,9 +10,14 @@ import json
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-import dlimp as dl
 import numpy as np
 import tensorflow as tf
+
+# TensorFlow is used only for the RLDS input pipeline. Hide GPUs before
+# importing dlimp/TFDS or other RLDS modules, which may initialize the runtime.
+tf.config.set_visible_devices([], "GPU")
+
+import dlimp as dl
 import tensorflow_datasets as tfds
 
 from prismatic.overwatch import initialize_overwatch
@@ -29,10 +34,6 @@ from prismatic.vla.datasets.rlds.utils.data_utils import (
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
-
-
-# Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
-tf.config.set_visible_devices([], "GPU")
 
 
 # ruff: noqa: B006

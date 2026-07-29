@@ -802,7 +802,14 @@ class RobotSSMObjectLossWithTrack(nn.Module):
             self.event_loss_focal = FocalLoss()
             # self.event_loss = jaccard_loss
 
-    def preprocess(self, all_obj_bboxes, all_obj_segids, all_pixel_seg_values, all_interaction_cnts):
+    def preprocess(
+        self,
+        all_obj_bboxes,
+        all_obj_segids,
+        all_pixel_seg_values,
+        all_interaction_cnts,
+        include_segs=True,
+    ):
         object_gts = {}
 
         # Get obj boxes
@@ -817,19 +824,20 @@ class RobotSSMObjectLossWithTrack(nn.Module):
             )
             object_gts["bboxes"].append(temp_obj_bboxes)
 
-        # Get obj seg maps
-        object_gts["segs"] = []  # [b x o x h x img_dim]
-        for b, obj_segids in enumerate(all_obj_segids):
-            obj_masks = []
-            for segid_trajectory in obj_segids:
-                segids = torch.as_tensor(
-                    segid_trajectory,
-                    device=all_pixel_seg_values.device,
-                ).view(-1, 1, 1)
-                valid = segids >= 0
-                obj_masks.append((all_pixel_seg_values[b] == segids) & valid)
-            obj_masks = torch.stack(obj_masks, dim=0)
-            object_gts["segs"].append(obj_masks)
+        if include_segs:
+            # Get obj seg maps
+            object_gts["segs"] = []  # [b x o x h x img_dim]
+            for b, obj_segids in enumerate(all_obj_segids):
+                obj_masks = []
+                for segid_trajectory in obj_segids:
+                    segids = torch.as_tensor(
+                        segid_trajectory,
+                        device=all_pixel_seg_values.device,
+                    ).view(-1, 1, 1)
+                    valid = segids >= 0
+                    obj_masks.append((all_pixel_seg_values[b] == segids) & valid)
+                obj_masks = torch.stack(obj_masks, dim=0)
+                object_gts["segs"].append(obj_masks)
 
         # Get interaction events
         object_gts["itrn_cnt"] = [] # [b x o x (h-1)]

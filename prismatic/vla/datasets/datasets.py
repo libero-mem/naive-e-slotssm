@@ -1270,6 +1270,7 @@ class RLDSBatchTransformV3_1:
     image_transform: ImageTransform
     prompt_builder_fn: Type[PromptBuilder]
     predict_stop_token: bool = True
+    include_segmentation: bool = True
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -1358,23 +1359,20 @@ class RLDSBatchTransformV3_1:
         all_pixel_values = []
         for img_data in rlds_batch["observation"]["image_primary"]:
             img_data = img_data[:,:,:]
-            import cv2
-            # cv2.imwrite('./tmp_img_training.png', img_data); 1/0
 
             img = Image.fromarray(img_data)
             # img.save("img.png")
             pixel_values = self.image_transform(img)
             all_pixel_values.append(pixel_values)
         all_pixel_values = torch.stack(all_pixel_values)
-        all_pixel_seg_values = []
-        for img_data in rlds_batch["observation"]["image_primary_seg"]:
-            img_data = img_data[:,:,0]
-            # import cv2
-            # cv2.imwrite('./tmp_img_training.png', img_data) #; 1/0
-            # img.save("img.png")
-            pixel_values = torch.from_numpy(np.array(img_data, copy=True))
-            all_pixel_seg_values.append(pixel_values)
-        all_pixel_seg_values = torch.stack(all_pixel_seg_values)
+        all_pixel_seg_values = None
+        if self.include_segmentation:
+            all_pixel_seg_values = []
+            for img_data in rlds_batch["observation"]["image_primary_seg"]:
+                img_data = img_data[:,:,0]
+                pixel_values = torch.from_numpy(np.array(img_data, copy=True))
+                all_pixel_seg_values.append(pixel_values)
+            all_pixel_seg_values = torch.stack(all_pixel_seg_values)
 
         all_wrist_values = None
         all_wrist_seg_values = None
@@ -1392,15 +1390,13 @@ class RLDSBatchTransformV3_1:
                 all_wrist_values.append(wrist_values)
             all_wrist_values = torch.stack(all_wrist_values)
 
-            all_wrist_seg_values = []
-            for img_data in rlds_batch["observation"]["image_wrist_seg"]:
-                img_data = img_data[:,:,0]
-                # import cv2
-                # cv2.imwrite('./tmp_img_training.png', img_data) #; 1/0
-                # img.save("img.png")
-                wrist_values = torch.from_numpy(np.array(img_data, copy=True))
-                all_wrist_seg_values.append(wrist_values)
-            all_wrist_seg_values = torch.stack(all_wrist_seg_values)
+            if self.include_segmentation:
+                all_wrist_seg_values = []
+                for img_data in rlds_batch["observation"]["image_wrist_seg"]:
+                    img_data = img_data[:,:,0]
+                    wrist_values = torch.from_numpy(np.array(img_data, copy=True))
+                    all_wrist_seg_values.append(wrist_values)
+                all_wrist_seg_values = torch.stack(all_wrist_seg_values)
 
         all_pixel_depth_values = None
         if "depth_primary" in rlds_batch["observation"]:
