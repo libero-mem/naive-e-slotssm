@@ -1,0 +1,27 @@
+CUDA_VISIBLE_DEVICES=0,1 torchrun     --standalone     --nnodes 1     --nproc-per-node 2     vla-scripts/finetune-1_slotvla_slot-wo-filter.py     --vla_path openvla/openvla-7b     --data_root_dir /mnt/data/data_nhat/LIBERO-Mem-RLDS     --dataset_name libero_mem     --run_root_dir /mnt/data/data_nhat/LIBERO-Mem/weights/runs     --adapter_tmp_dir /mnt/data/data_nhat/LIBERO-Mem/weights/adapters     --output_dir /mnt/data/data_nhat/LIBERO-Mem/weights     --max_steps 2500     --save_steps 500     --batch_size 16     --horizon_size 32     --number_of_slots 16     --learning_rate 1e-4     --grad_accumulation_steps 1     --image_aug True     --modality_key 1000
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun \
+  --standalone \
+  --nnodes 1 \
+  --nproc-per-node 2 \
+  vla-scripts/finetune-2_slotssm_pretrain.py \
+  --vla_path openvla/openvla-7b \
+  --data_root_dir /mnt/data/data_nhat/LIBERO-Mem-RLDS \
+  --dataset_name libero_mem \
+  --run_root_dir /mnt/data/data_nhat/LIBERO-Mem/weights/runs \
+  --adapter_tmp_dir /mnt/data/data_nhat/LIBERO-Mem/weights/adapters \
+  --load_slot_path /mnt/data/data_nhat/LIBERO-Mem/weights/pretrained_slots-wo-filters_s16.safetensors \
+  --interaction_cache_path /mnt/data/data_nhat/LIBERO-Mem/weights/cnt_text_embeddings.pt \
+  --max_steps 2500 \
+  --save_steps 500 \
+  --batch_size 16 \
+  --horizon_size 32 \
+  --bwd_steps 25 \
+  --fwd_steps 6 \
+  --number_of_slots 16 \
+  --learning_rate 1e-4 \
+  --grad_accumulation_steps 1 \
+  --image_aug True \
+  --modality_key 1000 \
+  --use_lora False \
+  --use_quantization False

@@ -237,7 +237,7 @@ def make_dataset_from_rlds(
     elif 'libero_90' in name:
         builder = tfds.builder_from_directory(builder_dir=data_dir + '/libero/rlds_datasets/libero_90/liber_o90/1.0.0')
     elif 'libero_mem' in name:
-        builder = tfds.builder_from_directory(builder_dir=data_dir + '/libero/rlds_datasets/libero_mem/1.0.0')
+        builder = tfds.builder_from_directory(builder_dir=data_dir + '/libero_mem/1.0.0')
     else:
         builder = tfds.builder(name, data_dir=data_dir)
 

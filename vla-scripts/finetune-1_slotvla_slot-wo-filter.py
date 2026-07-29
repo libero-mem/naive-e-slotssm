@@ -6,13 +6,11 @@ This script:
 - Loads a pretrained OpenVLA model and processor from HuggingFace.
 - Freezes the main vision backbone, projector, and language model.
 - Wraps the base model with a custom object-centric slot-attention head.
-- Loads pretrained slot weights from a .safetensors checkpoint.
+- Optionally initializes the object-centric modules from a Safetensors checkpoint.
 - Optionally enables LoRA or 4-bit quantization for parameter-efficient training.
 - Trains on an RLDS-formatted robotics dataset with RGB/depth sequences.
-- Uses language annotations, object masks, bounding boxes, and interaction labels
-  to supervise object-centric predictions.
-- Optimizes a combined loss over bounding boxes, masks, objectness, and
-  interactability.
+- Uses object masks and bounding boxes to supervise object-centric predictions.
+- Optimizes a combined loss over bounding boxes, masks, and objectness.
 - Periodically saves object-centric weights during training.
 
 Expected data:
@@ -21,8 +19,7 @@ Expected data:
   - image tensors
   - segmentation maps
   - object metadata
-  - language instructions
-  - per-object reasoning and interaction annotations
+  - per-object reasoning annotations
 
 How to run:
 
@@ -37,7 +34,6 @@ Single-GPU:
         --dataset_name "real_data" \
         --run_root_dir "/path/to/checkpoints" \
         --adapter_tmp_dir "/path/to/adapters" \
-        --load_slot_path "/path/to/pretrained_slots.safetensors" \
         --batch_size 16 \
         --horizon_size 36 \
         --number_of_slots 16 \
@@ -81,14 +77,12 @@ Example output:
   - `loss_giou`
   - `loss_objectness`
   - `loss_obj_seg`
-  - `loss_interactable`
 """
 
-from __future__ import annotations
+# from __future__ import annotations
 
 import os
-import sys
-from collections import deque
+import resource
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -116,11 +110,10 @@ from transformers import (
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from prismatic.debug_tools import denormalize_from_DINO
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import (
     OpenVLAForActionPrediction,
-    OpenVLAForActionPrediction_LangSlotAtt,
+    OpenVLAForActionPrediction_SlotAtt,
 )
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.losses.training_losses import RobotSSMObjectLossWithTrack
@@ -128,9 +121,8 @@ from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV1
 from prismatic.util.data_utils import PaddedCollatorForActionPredictionV3
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransformV3, RLDSDatasetV3
+from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from scipy.ndimage import center_of_mass
-from torch.utils.tensorboard import SummaryWriter
-import wandb
 
 
 MODALITIES = ("rgb_main", "rgb_wrist", "depth_main", "depth_wrist")
@@ -139,6 +131,8 @@ def process_modality_key(modality_key: str) -> tuple[dict[str, bool], int]:
     """Convert a 4-char binary modality string into flags."""
     if len(modality_key) != len(MODALITIES):
         raise ValueError(f"modality_key must have length {len(MODALITIES)}, got {modality_key!r}")
+    if any(value not in {"0", "1"} for value in modality_key):
+        raise ValueError(f"modality_key must contain only '0' and '1', got {modality_key!r}")
 
     modality_flags: dict[str, bool] = {}
     modality_num = 0
@@ -216,17 +210,21 @@ def process_interactions(reasoning_on_image):
 
 
 def process_seg_ids(reasoning_on_image):
-    """Extract segmentation IDs per object."""
+    """Build per-object segmentation-ID trajectories over the horizon."""
     batched_seg_ids = []
 
     for batch_entry in reasoning_on_image:
-        seg_ids: dict[str, int] = {}
+        object_keys: list[str] = []
 
         for horizon_entry in batch_entry:
-            for key, datum in horizon_entry.items():
-                if key not in seg_ids:
-                    seg_ids[key] = datum[1]
+            for key in horizon_entry:
+                if key not in object_keys:
+                    object_keys.append(key)
 
+        seg_ids = {
+            key: [horizon_entry[key][1] if key in horizon_entry else -1 for horizon_entry in batch_entry]
+            for key in object_keys
+        }
         batched_seg_ids.append(seg_ids)
 
     return batched_seg_ids
@@ -307,7 +305,8 @@ class FinetuneConfig:
     dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     adapter_tmp_dir: Path = Path("vla-scripts/tmp")                     # Temporary directory for LoRA weights before fusing
-    load_slot_path: Path = Path("/cm/shared/weights/openvla/adapters/output_hf_model_openx+libero_goal+b6+lr-2e-05--image_aug--multiview1000/object_centric_w_mask.safetensors")
+    output_dir: Path = Path(".")                                    # Directory for the object-centric safetensors checkpoint
+    load_slot_path: Optional[Path] = None                            # Optional object-centric initialization checkpoint
 
     # Fine-tuning Parameters
     batch_size: int = 16                                            # Fine-tuning batch size
@@ -318,11 +317,7 @@ class FinetuneConfig:
     learning_rate: float = 2e-5                                     # Fine-tuning learning rate
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
-    shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
-    save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
-                                                                    #   continually overwrite the latest checkpoint
-                                                                    #   (If False, saves all checkpoints)
-
+    shuffle_buffer_size: int = 10_000                               # RLDS shuffle buffer; large windows consume substantial RAM
     # LoRA Arguments
     use_lora: bool = False                                           # Whether to use LoRA fine-tuning
     lora_rank: int = 32                                             # Rank of LoRA weight matrix
@@ -330,9 +325,6 @@ class FinetuneConfig:
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
-    # Tracking Parameters
-    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
 
     # fmt: on
@@ -372,6 +364,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(adapter_dir, exist_ok=True)
+    os.makedirs(cfg.output_dir, exist_ok=True)
 
     # Quantization Config =>> only if LoRA fine-tuning
     quantization_config = None
@@ -399,9 +392,31 @@ def finetune(cfg: FinetuneConfig) -> None:
     vla.vision_backbone.requires_grad_(False)
     vla.projector.requires_grad_(False)
     vla.language_model.requires_grad_(False)
+    # Stage 1 calls only the vision backbone through `get_obj_slots`; keeping the
+    # 7B language model and projector would waste most of the resident GPU memory.
+    del vla.language_model
+    del vla.projector
     vla = OpenVLAForActionPrediction_SlotAtt(model=vla, number_of_slots=cfg.number_of_slots)
-    weights = load_file(cfg.load_slot_path)
-    vla.load_state_dict(weights, strict=False)
+
+    if cfg.load_slot_path is None:
+        if distributed_state.is_main_process:
+            print("No slot checkpoint provided; training object-centric modules from their default initialization.")
+    elif cfg.load_slot_path.is_file():
+        if distributed_state.is_main_process:
+            print(f"Loading initial slot weights from {cfg.load_slot_path}")
+        incompatible_keys = vla.load_state_dict(load_file(str(cfg.load_slot_path), device="cpu"), strict=False)
+        if distributed_state.is_main_process:
+            print(
+                "Loaded slot checkpoint with "
+                f"{len(incompatible_keys.missing_keys)} missing and "
+                f"{len(incompatible_keys.unexpected_keys)} unexpected keys."
+            )
+    elif distributed_state.is_main_process:
+        print(
+            f"Slot checkpoint not found at {cfg.load_slot_path}; "
+            "training object-centric modules from their default initialization."
+        )
+
     vla.object_centric_tokenizer.requires_grad_(True)
     vla.object_centric_bbox_head.requires_grad_(True)
     vla.object_centric_mask_head.requires_grad_(True)
@@ -415,7 +430,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
         # Get linear module names not in backbone
-        linear_module_names = get_linear_module_names(vla, exclude_pattern=['vision_backbone'])
+        linear_module_names = get_linear_module_names(vla, exclude_patterns=("vision_backbone",))
 
         lora_config = LoraConfig(
             r=cfg.lora_rank,
@@ -460,6 +475,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         print("Debug mode uses small batch size=",2)
         cfg.batch_size = 2
 
+    modality_flags, _ = process_modality_key(cfg.modality_key)
+    unsupported_modalities = [
+        name for name, enabled in modality_flags.items()
+        if enabled and name != "rgb_main"
+    ]
+    if not modality_flags["rgb_main"] or unsupported_modalities:
+        raise ValueError(
+            "Stage 1 SlotAtt currently consumes main RGB only; use --modality_key 1000. "
+            f"Unsupported enabled modalities: {unsupported_modalities}"
+        )
+
     window_size = cfg.horizon_size
     batch_transform = RLDSBatchTransformV3(
         action_tokenizer,
@@ -476,8 +502,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         window_size=window_size,
-        load_camera_views=("primary", "wrist"),
-        load_depth=True,
+        load_camera_views=("primary",),
+        load_depth=False,
         cropping=False
     )
     
@@ -493,35 +519,19 @@ def finetune(cfg: FinetuneConfig) -> None:
         num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
     )
 
-    # # Initialize Logging =>> W&B
-    # if distributed_state.is_main_process:
-    #     writer = SummaryWriter(log_dir=f"runs/{cfg.wandb_project}/ft+{exp_id}")
-    #     # wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}",
-    #     #            config={"_service_wait": 120})
-    #     pass
-
-    # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
-    recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
-
     # Train!
-    chosen_data = None
-    final_save = False
-    modality_flags, modality_num = process_modality_key(cfg.modality_key)
     object_loss = RobotSSMObjectLossWithTrack(interact_required=False)
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
+        torch.cuda.reset_peak_memory_stats(device_id)
+        completed_steps = 0
         for batch_idx, batch in enumerate(dataloader):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 pixel_values = batch["all_pixel_values"].to(torch.bfloat16).to(device_id)
-                batch_size = batch["all_pixel_values"].shape[0]
-                texts = ["robot " + batch["tasks"][b]["instruction"] for b in range(batch_size)]
 
                 reasoning_on_image=batch["reasoning_on_image"]
 
-                all_interaction_cnts = process_interactions(reasoning_on_image) # [B x H] lists of dicts of interactions
                 all_seg_ids = process_seg_ids(reasoning_on_image)               # [B x H] lists of dicts of seg ids
                 all_bboxes = process_bboxes(reasoning_on_image)                 # [B x H] lists of dicts of bboxes [cx cy w h, obj] in [0,1]
 
@@ -529,8 +539,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 all_obj_keys = [list(all_bboxes[b].keys()) for b in range(len(all_bboxes))]
                 all_obj_bboxes = [[horizon_bboxes[key] for key in all_obj_keys[i]] for i,horizon_bboxes in enumerate(all_bboxes)]    # [B x O x H x 5]
                 all_obj_segids = [[horizon_seg_ids[key] for key in all_obj_keys[i]] for i,horizon_seg_ids in enumerate(all_seg_ids)] # [B x O x H]
-                all_obj_itrn_cnts = [[horizon_itrn_cnts[key] for key in all_obj_keys[i]] for i,horizon_itrn_cnts in enumerate(all_interaction_cnts)] # [B x O x H]
-                
                 all_pixel_seg_values = batch["all_pixel_seg_values"]
                 bz, horizon, H, W = all_pixel_seg_values.shape
                 # downsampling the seg values
@@ -551,22 +559,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                     # print('sample_pred_segs', pred_segs.shape)
                     # pred_bboxes = pred_bboxes.permute(0, 2, 1, 3)
                     # pred_segs = pred_segs.permute(0, 2, 1, 3, 4)
-                    outputs = vla.module.get_obj_slots(pixel_values, texts)
+                    outputs = vla.module.get_obj_slots(pixel_values)
                     object_preds = {'bboxes': outputs['bboxes'].permute(0, 2, 1, 3),
-                                    'segs': outputs['masks'].permute(0, 2, 1, 3, 4),
-                                    'interact': outputs['interact'].permute(0, 2, 1, 3)}
+                                    'segs': outputs['masks'].permute(0, 2, 1, 3, 4)}
                     object_gts = object_loss.preprocess(
                         all_obj_bboxes,
                         all_obj_segids, all_pixel_seg_values,
-                        all_obj_itrn_cnts
+                        None,
                     )
-                    object_interactables = []
-                    for b in range(len(all_bboxes)):
-                        bi_interactables = torch.ones((len(list(all_bboxes[b].keys())), horizon, 1)).to(device_id)
-                        object_interactables.append(bi_interactables)
-                    losses, indices = object_loss(object_preds, object_gts)
-                    losses['loss_interactable'] = object_loss.get_interactable_loss(object_preds['interact'], object_interactables, 
-                                                                                    indices, device_id)
+                    losses, _ = object_loss(object_preds, object_gts)
                     updated_losses = object_loss.update_weights(
                         losses,
                         weights={
@@ -574,7 +575,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                             'loss_giou': 1,
                             'loss_objectness': 1,
                             'loss_obj_seg': 1,
-                            'loss_interactable': 10,
                         }
                     )
 
@@ -586,48 +586,58 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Backward pass
             normalized_loss.backward()
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
-            # Push Metrics to W&B (every 10 gradient steps)
-            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                data_log = updated_losses
-                # wandb.log(
-                #     data_log,
-                #     step=gradient_step_idx,
-                # )
-                # for key, value in data_log.items():
-                #     writer.add_scalar(key, value.float(), global_step=gradient_step_idx)
-
-                print(data_log)
-                print(object_loss.get_jaccard_evaluations())
-                print(torch.min(object_preds['segs']), torch.max(object_preds['segs']))
-
             # Optimizer Step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            is_optimizer_step = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+            if is_optimizer_step:
                 optimizer.step()
                 optimizer.zero_grad()
+                completed_steps += 1
                 progress.update()
 
+            if distributed_state.is_main_process and is_optimizer_step and completed_steps % 10 == 0:
+                loss_metrics = {
+                    name: value.detach().float().item()
+                    for name, value in updated_losses.items()
+                }
+                mask_iou = 1.0 - object_loss.get_jaccard_evaluations().detach().float().item()
+                mask_logits = object_preds["segs"].detach().float()
+                print(
+                    {
+                        "step": completed_steps,
+                        **loss_metrics,
+                        "loss_total": sum(loss_metrics.values()),
+                        "mask_iou": mask_iou,
+                        "mask_logit_min": mask_logits.min().item(),
+                        "mask_logit_max": mask_logits.max().item(),
+                        "gpu_allocated_gib": torch.cuda.memory_allocated(device_id) / 2**30,
+                        "gpu_reserved_gib": torch.cuda.memory_reserved(device_id) / 2**30,
+                        "gpu_peak_gib": torch.cuda.max_memory_allocated(device_id) / 2**30,
+                        "host_peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20,
+                    }
+                )
+                torch.cuda.reset_peak_memory_stats(device_id)
+
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if (gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0):
+            should_save = (
+                completed_steps > 0
+                and is_optimizer_step
+                and (completed_steps % cfg.save_steps == 0 or completed_steps >= cfg.max_steps)
+            )
+            if should_save:
 
                 if distributed_state.is_main_process:
-                    print(f"Saving Model Checkpoint for Step {gradient_step_idx} at", adapter_dir)
+                    checkpoint_path = cfg.output_dir / f"pretrained_slots-wo-filters_s{cfg.number_of_slots}.safetensors"
+                    print(f"Saving model checkpoint for step {completed_steps} to {checkpoint_path}")
 
                     merged_state_dict = vla.module.state_dict()
                     object_centric_state_dict = {k: v for k, v in merged_state_dict.items() if 'object_centric' in k}
-                    save_file(object_centric_state_dict, f"./pretrained_slots-wo-filters_s16.safetensors")
-                    if gradient_step_idx % 10000 == 0:
-                        break
+                    save_file(object_centric_state_dict, str(checkpoint_path))
 
                 # Wait for processor and adapter weights to be saved by main process
                 dist.barrier()
             
-
-
-                # # Block on Main Process Checkpointing
-                # dist.barrier()
+            if completed_steps >= cfg.max_steps:
+                break
 
 if __name__ == "__main__":
     finetune()

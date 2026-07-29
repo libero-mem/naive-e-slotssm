@@ -108,15 +108,31 @@ class HungarianMatcherbboxTRACK(nn.Module):
             if targets[b] is None:
                 continue
             tgt_boxes = targets[b].float().to(out_bbox.device)
+            num_targets = tgt_boxes.shape[0]
+            if num_targets > num_queries:
+                raise ValueError(
+                    f"Batch item {b} has {num_targets} tracked objects but only "
+                    f"{num_queries} slots are available."
+                )
 
-            out_bbox, tgt_boxes = out_bbox.permute(1, 0, 2), tgt_boxes.permute(1, 0, 2)
-            cost_bbox = torch.cdist(out_bbox, tgt_boxes, p=1).sum(0)
+            out_bbox = out_bbox.permute(1, 0, 2)  # [H, slots, 5]
+            tgt_boxes = tgt_boxes.permute(1, 0, 2)  # [H, objects, 5]
+            visible = tgt_boxes[..., 4] > 0.5  # [H, objects]
+            visible_count = visible.sum(dim=0).clamp(min=1)
+
+            frame_bbox_cost = torch.cdist(out_bbox[..., :4], tgt_boxes[..., :4], p=1)
+            cost_bbox = (
+                frame_bbox_cost * visible[:, None, :]
+            ).sum(dim=0) / visible_count[None, :]
 
             cost_giou = 0
             for h in range(horizon):
-                # print(b, h, box_cxcywh_to_xyxy(out_bbox[h,:,:4]), box_cxcywh_to_xyxy(tgt_boxes[h,:,:4]))
-                # print(-generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[h,:,:4]), box_cxcywh_to_xyxy(tgt_boxes[h,:,:4])))
-                cost_giou += -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[h,:,:4]), box_cxcywh_to_xyxy(tgt_boxes[h,:,:4]))
+                frame_giou = -generalized_box_iou(
+                    box_cxcywh_to_xyxy(out_bbox[h, :, :4]),
+                    box_cxcywh_to_xyxy(tgt_boxes[h, :, :4]),
+                )
+                cost_giou += frame_giou * visible[h][None, :]
+            cost_giou = cost_giou / visible_count[None, :]
 
             C = self.cost_bbox * cost_bbox + self.cost_giou * cost_giou
 
@@ -529,15 +545,25 @@ class BoxLossWithTrackV2(nn.Module):
             losses['loss_giou'] = 0
             losses['loss_objectness'] = 0
         else:
-            bn, horizon, dim = src_boxes.shape
+            _, horizon, _ = src_boxes.shape
+            visibility = target_boxes[:, :, 4].float()
+            visible_count = visibility.sum().clamp(min=1.0)
+
             loss_bbox = F.l1_loss(src_boxes[:,:,:4], target_boxes[:,:,:4], reduction='none')
-            losses['loss_bbox'] = loss_bbox.sum() / (num_interactions) * self.bbox_coef
+            losses['loss_bbox'] = (
+                loss_bbox * visibility[:, :, None]
+            ).sum() / visible_count * self.bbox_coef
 
             loss_giou = 0
             for h in range(horizon):
-                loss_giou += 1 - torch.diag(generalized_box_iou(box_cxcywh_to_xyxy(src_boxes[:,h,:4]), 
-                                                            box_cxcywh_to_xyxy(target_boxes[:,h,:4])))
-            losses['loss_giou'] = loss_giou.sum() / (num_interactions) * self.giou_coef
+                frame_giou_loss = 1 - torch.diag(
+                    generalized_box_iou(
+                        box_cxcywh_to_xyxy(src_boxes[:, h, :4]),
+                        box_cxcywh_to_xyxy(target_boxes[:, h, :4]),
+                    )
+                )
+                loss_giou += (frame_giou_loss * visibility[:, h]).sum()
+            losses['loss_giou'] = loss_giou / visible_count * self.giou_coef
 
             pred_ones = src_boxes[:,:,4] # needs to be aligned with 1
             unmatched_preds = get_unmatched_src_data(outputs, indices)
@@ -546,12 +572,21 @@ class BoxLossWithTrackV2(nn.Module):
             assert(pred_ones.shape[0]+pred_zeros.shape[0] == outputs.shape[0]*outputs.shape[1])
             
             preds = torch.cat([pred_ones, pred_zeros], dim=0).flatten()
-            labels = torch.cat([torch.ones_like(pred_ones), 
-                                torch.zeros_like(pred_zeros)], dim=0).flatten()
+            labels = torch.cat([visibility.to(pred_ones.dtype),
+                            torch.zeros_like(pred_zeros)], dim=0).flatten()
 
             if self.objectness_required:
                 with torch.cuda.amp.autocast(enabled=False):
-                    losses['loss_objectness'] = torch.nn.functional.binary_cross_entropy(preds, labels, reduction='sum') / num_interactions * self.obj_coef
+                    preds, labels = preds.float(), labels.float()
+                    positive = labels > 0.5
+                    negative = ~positive
+                    positive_loss = torch.nn.functional.binary_cross_entropy(
+                        preds[positive], labels[positive], reduction='mean'
+                    ) if positive.any() else preds.sum() * 0
+                    negative_loss = torch.nn.functional.binary_cross_entropy(
+                        preds[negative], labels[negative], reduction='mean'
+                    ) if negative.any() else preds.sum() * 0
+                    losses['loss_objectness'] = 0.5 * (positive_loss + negative_loss) * self.obj_coef
 
             # print(src_boxes[:,:,5].shape)
             # print(src_boxes[:,:,5])
@@ -595,13 +630,10 @@ class BoxLossWithTrackV2(nn.Module):
         return self.loss_boxes(bboxes, gt_bboxes, indices, num_interactions)
 
 class SegmentationLossWithTrack(nn.Module):
-    def __init__(self, foreground_weight=100.0, eval_mode=False):
+    def __init__(self, foreground_weight=30.0, eval_mode=False):
         super().__init__()
         self.eval_mode = eval_mode
-        # self.criterion = self.jaccard_loss
-
-        self.pos_weight = torch.tensor([foreground_weight])
-        self.criterion = F.binary_cross_entropy_with_logits
+        self.max_foreground_weight = foreground_weight
 
     def jaccard_loss(self, preds, targets, eps=1e-7):
         # preds: shape [B, D], values in [0,1]
@@ -612,31 +644,58 @@ class SegmentationLossWithTrack(nn.Module):
         loss = 1.0 - jaccard
         return loss
 
-    def get_jaccard_loss(self, features, gt_features, indices):
-        device = features.device
+    def get_jaccard_loss(self, features, gt_features, indices, visibility=None):
         src_features, target_features = _get_matched_pairs(features, gt_features, indices)
-        # print(torch.min(src_features), torch.max(src_features), torch.mean(src_features))
-        src_features = src_features.detach().flatten(2,3).flatten(0,1).sigmoid()
-        target_features = target_features.detach().flatten(2,3).flatten(0,1).float()
+        if visibility is not None:
+            matched_visibility = torch.cat(
+                [target[index] for target, (_, index) in zip(visibility, indices)],
+                dim=0,
+            ).to(features.device).bool()
+            src_features = src_features[matched_visibility]
+            target_features = target_features[matched_visibility]
+        if src_features.numel() == 0:
+            return features.detach().sum() * 0
+        src_features = src_features.detach().flatten(1).sigmoid()
+        target_features = target_features.detach().flatten(1).float()
         return self.jaccard_loss(src_features, target_features).mean()
 
-    def forward(self, features, gt_features, indices):
-        # num_interactions = sum(t.shape[0] for t in gt_features)
-        # num_interactions = torch.as_tensor([num_interactions], dtype=torch.float, device=features.device)
-        # num_interactions = torch.clamp(num_interactions, min=1).item()
+    def forward(self, features, gt_features, indices, visibility=None):
         device = features.device
         src_features, target_features = _get_matched_pairs(features, gt_features, indices)
-        # print(torch.min(src_features), torch.max(src_features), torch.mean(src_features))
-        src_features = src_features.flatten()
-        target_features = target_features.flatten().float()
-        if self.eval_mode:
-            return {
-                'loss_obj_seg': self.criterion(src_features, target_features, pos_weight=self.pos_weight.to(device), reduction='sum')
-            }
-        
-        return {
-            'loss_obj_seg': self.criterion(src_features, target_features, pos_weight=self.pos_weight.to(device))
-        }
+        if visibility is not None:
+            matched_visibility = torch.cat(
+                [target[index] for target, (_, index) in zip(visibility, indices)],
+                dim=0,
+            ).to(device).bool()
+            src_features = src_features[matched_visibility]
+            target_features = target_features[matched_visibility]
+        if src_features.numel() == 0:
+            return {'loss_obj_seg': features.sum() * 0}
+
+        logits = src_features.float()
+        targets = target_features.float()
+        positives = targets.sum()
+        negatives = targets.numel() - positives
+        positive_weight = (negatives / positives.clamp(min=1.0)).clamp(
+            min=1.0,
+            max=self.max_foreground_weight,
+        ).detach()
+
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            pos_weight=positive_weight,
+        )
+
+        probabilities = logits.sigmoid().flatten(1)
+        flat_targets = targets.flatten(1)
+        intersection = (probabilities * flat_targets).sum(dim=1)
+        dice_loss = 1.0 - (
+            (2.0 * intersection + 1.0)
+            / (probabilities.sum(dim=1) + flat_targets.sum(dim=1) + 1.0)
+        )
+
+        return {'loss_obj_seg': bce_loss + dice_loss.mean()}
 
 class ObjectCentricLossV2(nn.Module):
     # object centric losses is designed for slots to learn
@@ -752,8 +811,9 @@ class RobotSSMObjectLossWithTrack(nn.Module):
             temp_obj_bboxes = []
             for obj_data in obj_bboxes:
                 temp_obj_bboxes.append(np.stack(obj_data, axis=0))
-            temp_obj_bboxes = torch.tensor(
-                np.stack(temp_obj_bboxes, axis=0)
+            temp_obj_bboxes = torch.as_tensor(
+                np.stack(temp_obj_bboxes, axis=0),
+                dtype=torch.float32,
             )
             object_gts["bboxes"].append(temp_obj_bboxes)
 
@@ -761,8 +821,13 @@ class RobotSSMObjectLossWithTrack(nn.Module):
         object_gts["segs"] = []  # [b x o x h x img_dim]
         for b, obj_segids in enumerate(all_obj_segids):
             obj_masks = []
-            for s, segid in enumerate(obj_segids):
-                obj_masks.append(all_pixel_seg_values[b] == segid)
+            for segid_trajectory in obj_segids:
+                segids = torch.as_tensor(
+                    segid_trajectory,
+                    device=all_pixel_seg_values.device,
+                ).view(-1, 1, 1)
+                valid = segids >= 0
+                obj_masks.append((all_pixel_seg_values[b] == segids) & valid)
             obj_masks = torch.stack(obj_masks, dim=0)
             object_gts["segs"].append(obj_masks)
 
@@ -849,9 +914,11 @@ class RobotSSMObjectLossWithTrack(nn.Module):
         bz, num_boxes, horizon, box_dim = object_preds["bboxes"].shape
         batched_gt_bboxes = []; batched_pd_bboxes = object_preds["bboxes"]
         batched_gt_segs = []; batched_pd_segs = object_preds["segs"]
+        batched_visibility = []
         for i in range(bz):
             batched_gt_bboxes.append(object_gts["bboxes"][i].to(device))
             batched_gt_segs.append(object_gts["segs"][i].to(device))
+            batched_visibility.append(object_gts["bboxes"][i][..., 4].to(device) > 0.5)
         # find optimal assignment based on bboxes
         if indices is None:
             indices = self.bbox_matcher(batched_pd_bboxes, batched_gt_bboxes)
@@ -859,9 +926,11 @@ class RobotSSMObjectLossWithTrack(nn.Module):
         # print(indices); 1/0
         losses = {}
         losses.update(self.bbox_loss(batched_pd_bboxes, batched_gt_bboxes, indices))
-        losses.update(self.seg_loss(batched_pd_segs, batched_gt_segs, indices))
+        losses.update(self.seg_loss(batched_pd_segs, batched_gt_segs, indices, batched_visibility))
         if implicit_jaccard:
-            self.jaccard_loss = self.seg_loss.get_jaccard_loss(batched_pd_segs, batched_gt_segs, indices)
+            self.jaccard_loss = self.seg_loss.get_jaccard_loss(
+                batched_pd_segs, batched_gt_segs, indices, batched_visibility
+            )
         return losses, indices
 
     def get_jaccard_evaluations(self):

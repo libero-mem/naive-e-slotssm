@@ -417,7 +417,7 @@ class RLDSDatasetV3(IterableDataset):
         window_size: int = 1,
         load_camera_views: Tuple[str] = ("primary",),
         load_depth: bool = False,
-        cropping = True
+        cropping = False
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -1185,7 +1185,7 @@ class RLDSBatchTransformV3:
             # import cv2
             # cv2.imwrite('./tmp_img_training.png', img_data) #; 1/0
             # img.save("img.png")
-            pixel_values = torch.from_numpy(img_data)
+            pixel_values = torch.from_numpy(np.array(img_data, copy=True))
             all_pixel_seg_values.append(pixel_values)
         all_pixel_seg_values = torch.stack(all_pixel_seg_values)
 
@@ -1211,7 +1211,7 @@ class RLDSBatchTransformV3:
                 # import cv2
                 # cv2.imwrite('./tmp_img_training.png', img_data) #; 1/0
                 # img.save("img.png")
-                wrist_values = torch.from_numpy(img_data)
+                wrist_values = torch.from_numpy(np.array(img_data, copy=True))
                 all_wrist_seg_values.append(wrist_values)
             all_wrist_seg_values = torch.stack(all_wrist_seg_values)
 
@@ -1372,7 +1372,7 @@ class RLDSBatchTransformV3_1:
             # import cv2
             # cv2.imwrite('./tmp_img_training.png', img_data) #; 1/0
             # img.save("img.png")
-            pixel_values = torch.from_numpy(img_data)
+            pixel_values = torch.from_numpy(np.array(img_data, copy=True))
             all_pixel_seg_values.append(pixel_values)
         all_pixel_seg_values = torch.stack(all_pixel_seg_values)
 
@@ -1398,7 +1398,7 @@ class RLDSBatchTransformV3_1:
                 # import cv2
                 # cv2.imwrite('./tmp_img_training.png', img_data) #; 1/0
                 # img.save("img.png")
-                wrist_values = torch.from_numpy(img_data)
+                wrist_values = torch.from_numpy(np.array(img_data, copy=True))
                 all_wrist_seg_values.append(wrist_values)
             all_wrist_seg_values = torch.stack(all_wrist_seg_values)
 

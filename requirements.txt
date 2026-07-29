@@ -1,0 +1,48 @@
+# Python 3.10
+#
+# Versions are based on the local Conda environment named `openvla`.
+# Run training from this repository root so the local `prismatic/` package is
+# imported instead of an unrelated installed package.
+
+# PyTorch / vision
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+timm==0.9.10
+
+# Hugging Face / parameter-efficient training
+accelerate==1.14.0
+huggingface-hub==0.36.2
+peft==0.11.1
+safetensors==0.8.0
+sentencepiece==0.1.99
+tokenizers==0.19.1
+transformers==4.40.1
+
+# RLDS / TensorFlow input pipeline
+tensorflow==2.15.0
+tensorflow-addons==0.23.0
+tensorflow-datasets==4.9.3
+tensorflow-graphics==2021.12.3
+protobuf==3.20.3
+
+# OpenVLA utilities
+draccus==0.8.0
+einops==0.8.2
+json-numpy==2.1.1
+jsonlines==4.0.0
+rich==15.0.0
+wandb==0.16.6
+
+# Numerical / visualization utilities used by this repository
+matplotlib==3.10.9
+numpy==1.26.4
+scipy==1.15.3
+tqdm==4.69.0
+
+# Use this repository's RLDS pipeline rather than a remote dlimp package.
+-e ./dlimp_openvla
+
+# The `openvla` environment also has flash-attn==2.5.5. Install it separately
+# after this file so its build can see the installed PyTorch:
+#   pip install flash-attn==2.5.5 --no-build-isolation

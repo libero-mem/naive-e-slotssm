@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import transformers
 from timm.models.vision_transformer import LayerScale
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
@@ -712,17 +713,15 @@ class SlotAttention(nn.Module):
         return slots, attn_before_reweighting #.mean(dim=2)
 
     def iterate(self, slots, k, v, masks=None):
-        # Slot update.
-        if self.training:
-            with torch.autocast(device_type='cuda', dtype=torch.float32):
-                for _ in range(self.iters):
-                    slots, attn = self.step(slots, k, v, masks)
-            slots, attn = slots.to(torch.bfloat16), attn.to(torch.bfloat16)
-        else:
-            with torch.autocast(device_type='cuda', dtype=torch.float32):
-                for _ in range(self.iters):
-                    slots, attn = self.step(slots, k, v, masks)
-            slots, attn = slots.to(torch.bfloat16), attn.to(torch.bfloat16)
+        # Run the iterative grouping in FP32 for stable attention and GRU updates.
+        # CUDA autocast does not support `dtype=torch.float32`; explicitly disabling
+        # autocast and casting the state is required.
+        with torch.autocast(device_type=slots.device.type, enabled=False):
+            slots, k, v = slots.float(), k.float(), v.float()
+            for _ in range(self.iters):
+                slots, attn = self.step(slots, k, v, masks)
+
+        slots, attn = slots.to(torch.bfloat16), attn.to(torch.bfloat16)
         return slots, attn
 
     def forward(
@@ -854,9 +853,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MaskPredictionHead(nn.Module):
-    def __init__(self, slot_dim, hidden_dim=64, mask_size=(224, 224)):
+    def __init__(self, slot_dim, hidden_dim=64, mask_size=(224, 224), decode_chunk_size=32):
         super().__init__()
         self.H, self.W = mask_size
+        self.decode_chunk_size = decode_chunk_size
 
         # Linear projection to conv-friendly shape
         self.proj = nn.Linear(slot_dim, hidden_dim)
@@ -871,7 +871,11 @@ class MaskPredictionHead(nn.Module):
         )
 
         # Positional encoding: 2 channels (x, y)
-        self.positional_encoding = self._build_2d_pos_enc(self.H, self.W)
+        self.register_buffer(
+            "positional_encoding",
+            self._build_2d_pos_enc(self.H, self.W),
+            persistent=False,
+        )
 
     def _build_2d_pos_enc(self, H, W):
         y, x = torch.meshgrid(
@@ -882,32 +886,27 @@ class MaskPredictionHead(nn.Module):
         pos = torch.stack([x, y], dim=0)  # Shape: [2, H, W]
         return pos  # Not learnable, but can be made learnable
 
+    def _decode_chunk(self, projected_slots):
+        chunk_size = projected_slots.shape[0]
+        slot_grid = projected_slots[:, :, None, None].expand(-1, -1, self.H, self.W)
+        pos_grid = self.positional_encoding.to(dtype=slot_grid.dtype)
+        pos_grid = pos_grid.unsqueeze(0).expand(chunk_size, -1, -1, -1)
+        return self.decoder(torch.cat([slot_grid, pos_grid], dim=1))
+
     def forward(self, slot_features):
-        """
-        slot_features: [B, num_slots, slot_dim]
-        Returns: binary_masks [B, num_slots, H, W]
-        """
-        B, num_slots, slot_dim = slot_features.shape
+        """Decode slot masks in checkpointed chunks to bound peak activation memory."""
+        batch_size, num_slots, _ = slot_features.shape
+        projected_slots = self.proj(slot_features).flatten(0, 1)
+        logits = []
 
-        # print('input', torch.min(slot_features), torch.max(slot_features))
-        # Project and spatially broadcast
-        slot_proj = self.proj(slot_features)  # [B, num_slots, hidden_dim]
-        # print('projs', torch.min(slot_proj), torch.max(slot_proj))
+        for projected_chunk in projected_slots.split(self.decode_chunk_size):
+            if self.training and torch.is_grad_enabled():
+                chunk_logits = checkpoint(self._decode_chunk, projected_chunk, use_reentrant=False)
+            else:
+                chunk_logits = self._decode_chunk(projected_chunk)
+            logits.append(chunk_logits)
 
-        slot_proj = slot_proj.view(B * num_slots, -1, 1, 1)
-        slot_proj = slot_proj.expand(-1, -1, self.H, self.W)  # [B*num_slots, hidden_dim, H, W]
-
-        # Add positional encoding
-        pos_enc = self.positional_encoding.to(slot_proj.device)  # [2, H, W]
-        pos_enc = pos_enc.unsqueeze(0).expand(B * num_slots, -1, -1, -1)  # [B*num_slots, 2, H, W]
-        x = torch.cat([slot_proj, pos_enc], dim=1)  # [B*num_slots, hidden_dim+2, H, W]
-
-        logits = self.decoder(x)  # [B*num_slots, 1, H, W]
-        masks = logits.view(B, num_slots, self.H, self.W)  # [B, num_slots, H, W]
-        # print('masks', torch.min(masks), torch.max(masks))
-        # print('sigmd', torch.min(masks.sigmoid()), torch.max(masks.sigmoid()))
-        # print('')
-        return masks
+        return torch.cat(logits, dim=0).view(batch_size, num_slots, self.H, self.W)
 
 class OpenVLAForActionPrediction_SlotAtt(nn.Module):
     config_class: PretrainedConfig = ObjectCentricVLAConfig
@@ -1347,18 +1346,19 @@ class EmbodiedSlotSSMBlock(nn.Module):
                  encoder_attn_num_heads=None, use_cross_attn=True, use_inverted_attention=False,
                  mamba_version='mamba2', layer_idx=None, attn_impl="flash_attention_2",
                  mamba_d_state=128, mamba_d_conv=4, mamba_expand=2, mamba_headdim=64,
-                 lookback_only=False):
+                 mamba_use_mem_eff_path=True, lookback_only=False, use_text_conditioning=True):
         super().__init__()
         assert mamba_version in ['mamba1', 'mamba2'], "Mamba version must be mamba1 or mamba2"
         assert attn_impl in ["flash_attention_2", "eager"], \
             "Attention implementation must be flash_attention_2 or eager"
         self.attn_impl = attn_impl
         self.lookback_only = lookback_only
+        self.use_text_conditioning = use_text_conditioning
         if use_cross_attn:
             self.visual_cross_attn_input_norm = nn.LayerNorm(d_model)
             self.visual_cross_attn_ref_norm = nn.LayerNorm(d_model)
             self.visual_proj = nn.Linear(visual_d_model, d_model) if visual_d_model is not None else None
-            if not lookback_only:
+            if use_text_conditioning:
                 self.textual_cross_attn_input_norm = nn.LayerNorm(d_model)
                 self.textual_cross_attn_ref_norm = nn.LayerNorm(d_model)
                 self.textual_proj = nn.Linear(textual_d_model, d_model) if textual_d_model is not None else None
@@ -1371,7 +1371,7 @@ class EmbodiedSlotSSMBlock(nn.Module):
                     inverted=True
                 )
 
-                if not lookback_only:
+                if use_text_conditioning:
                     self.textual_cross_attn = MultiHeadAttention(
                         d_model=d_model,
                         num_heads=encoder_attn_num_heads,
@@ -1384,7 +1384,7 @@ class EmbodiedSlotSSMBlock(nn.Module):
                         num_heads=encoder_attn_num_heads,
                         cross_attn=True
                     )
-                    if not lookback_only:
+                    if use_text_conditioning:
                         self.textual_cross_attn = MultiHeadAttention(
                             d_model=d_model,
                             num_heads=encoder_attn_num_heads,
@@ -1399,7 +1399,7 @@ class EmbodiedSlotSSMBlock(nn.Module):
                         inverted=False,
                         # output_attentions=True
                     )
-                    if not lookback_only:
+                    if use_text_conditioning:
                         self.textual_cross_attn = MultiHeadAttention(
                             d_model=d_model,
                             num_heads=encoder_attn_num_heads,
@@ -1417,6 +1417,7 @@ class EmbodiedSlotSSMBlock(nn.Module):
                 d_conv=mamba_d_conv,
                 expand=mamba_expand,
                 headdim=mamba_headdim,
+                use_mem_eff_path=mamba_use_mem_eff_path,
                 layer_idx=layer_idx
             )
         else:
@@ -1510,7 +1511,9 @@ class EmbodiedSlotSSMBlock(nn.Module):
         B, T, N, D = input.shape
         # Cross attention is enabled and ref is provided
         output_attn = None
-        if not self.lookback_only:
+        if self.use_text_conditioning:
+            if textual_ref is None:
+                raise ValueError("textual_ref is required when task conditioning is enabled")
             input, tex_output_attn = self.single_modality_cross_attn(input, ref=textual_ref, ref_attn=textual_attn,
                                                     input_proj_fn=self.textual_proj,
                                                     cross_attn_input_norm_fn=self.textual_cross_attn_input_norm,
@@ -1576,7 +1579,9 @@ class EmbodiedSlotSSM(nn.Module):
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
         mamba_headdim: int = 64,
+        mamba_use_mem_eff_path: bool = True,
         lookback_only: bool = False,
+        use_text_conditioning: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -1601,8 +1606,10 @@ class EmbodiedSlotSSM(nn.Module):
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
                 mamba_headdim=mamba_headdim,
+                mamba_use_mem_eff_path=mamba_use_mem_eff_path,
                 layer_idx=idx,
-                lookback_only=lookback_only
+                lookback_only=lookback_only,
+                use_text_conditioning=use_text_conditioning,
             )
             for idx in range(num_blocks)
         ])
@@ -3120,12 +3127,22 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32")
         self.object_centric_text_encoder = CLIPBasedTextEncoder(self.clip_model, self.clip_preprocess)
         d_model = 512
-        # self.object_centric_pre_ssm_fusion = SlotFusion(input_dims=[512,512], embed_dims=[512, 512], output_dim=512)
+        self.object_centric_pre_ssm_fusion = SlotFusion(
+            input_dims=[512, 512],
+            embed_dims=[512, 512],
+            output_dim=512,
+        )
+        # Start from the pretrained slots and learn conditioning as a residual.
+        nn.init.zeros_(self.object_centric_pre_ssm_fusion.out_projection.weight)
+        nn.init.zeros_(self.object_centric_pre_ssm_fusion.out_projection.bias)
         self.object_centric_ssm = EmbodiedSlotSSM(
             num_slots=self.object_token_num, num_blocks=3, d_model=d_model,
             d_input=None, visual_d_model=2176, textual_d_model=None,
             space_attn_num_heads=d_model // 64, use_inverted_attention=False, 
-            encoder_attn_num_heads=d_model // 64, lookback_only=True
+            encoder_attn_num_heads=d_model // 64,
+            mamba_use_mem_eff_path=True,
+            lookback_only=True,
+            use_text_conditioning=True,
         )
         # predicting the 16 steps backward and 8 steps head
         self.backward_steps = backward_step # 16
@@ -3231,7 +3248,13 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
             texts       = texts[:,:-redundant_steps]
             texts_attn  = texts_attn[:,:-redundant_steps]
 
-        # slots = self.object_centric_pre_ssm_fusion([slots, subgoals])
+        if subgoals is None:
+            raise ValueError("subgoals are required for conditioned SlotSSM dynamics")
+        if slots.shape != subgoals.shape:
+            raise ValueError(
+                f"slots and subgoals must have the same shape, got {slots.shape} and {subgoals.shape}"
+            )
+        slots = slots + self.object_centric_pre_ssm_fusion([slots, subgoals])
         latent_slots, attention, slot_lists = self.object_centric_ssm(slots, patch_features, texts, texts_attn, output_attentions=False)
         slots = self.object_centric_latent_decoder(torch.cat([latent_slots, slots], dim=-1))
         B, T, N, D_x_horizon_steps = slots.shape
@@ -3249,4 +3272,3 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
         output['nxt_masks'] = nxt_masks
 
         return output
-
