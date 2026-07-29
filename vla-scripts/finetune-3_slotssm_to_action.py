@@ -107,8 +107,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import tqdm
+import wandb
 from accelerate import PartialState
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from safetensors.torch import load_file, save_file
 from scipy.ndimage import center_of_mass
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -286,9 +287,11 @@ class FinetuneConfig:
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
     # Tracking Parameters
-    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+    run_id_note: Optional[str] = None                               # Optional suffix for the experiment ID
+    use_wandb: bool = True                                          # Log the main process to Weights & Biases
+    wandb_entity: str = "nhat"                                      # W&B entity
+    wandb_project: str = "libero-mem"                               # W&B project
+    log_steps: int = 10                                             # Console and W&B logging interval
 
     # fmt: on
     modality_key: str = "1000"     # Binary characters for using RGB main, RGB wrist, depth main, depth wrist
@@ -436,6 +439,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError("grad_accumulation_steps must be at least 1")
     if cfg.max_steps < 1 or cfg.save_steps < 1:
         raise ValueError("max_steps and save_steps must be at least 1")
+    if cfg.log_steps < 1:
+        raise ValueError("log_steps must be at least 1")
     if cfg.horizon_size != cfg.bwd_steps + cfg.fwd_steps + 1:
         raise ValueError(
             "horizon_size must equal bwd_steps + fwd_steps + 1; "
@@ -445,11 +450,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         raise ValueError(
             "action_loss_start_step must be within the horizon; "
             f"got {cfg.action_loss_start_step} for horizon {cfg.horizon_size}"
-        )
-    if cfg.resume:
-        raise NotImplementedError(
-            "--resume is not implemented for Stage 3; start a new run or "
-            "load a Stage-3 checkpoint explicitly after adding optimizer-state support"
         )
     if cfg.use_quantization:
         raise NotImplementedError(
@@ -501,6 +501,39 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(adapter_dir, exist_ok=True)
+    training_state_path = adapter_dir / "training_state.pt"
+    training_signature = {
+        "bwd_steps": cfg.bwd_steps,
+        "fwd_steps": cfg.fwd_steps,
+        "number_of_slots": cfg.number_of_slots,
+        "action_loss_start_step": cfg.action_loss_start_step,
+        "wandb_entity": cfg.wandb_entity,
+        "wandb_project": cfg.wandb_project,
+    }
+    resume_state = None
+    if cfg.resume:
+        if not training_state_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot resume: training state not found at {training_state_path}"
+            )
+        resume_state = torch.load(training_state_path, map_location="cpu")
+        if bool(resume_state.get("use_lora")) != cfg.use_lora:
+            raise ValueError(
+                "Resume configuration disagrees with the saved run: "
+                f"saved use_lora={resume_state.get('use_lora')}, "
+                f"requested use_lora={cfg.use_lora}"
+            )
+        if resume_state.get("training_signature") != training_signature:
+            raise ValueError(
+                "Resume configuration disagrees with the saved model signature: "
+                f"saved={resume_state.get('training_signature')}, "
+                f"requested={training_signature}"
+            )
+        if int(resume_state["completed_steps"]) >= cfg.max_steps:
+            raise ValueError(
+                "The saved run has already reached the requested max_steps: "
+                f"{resume_state['completed_steps']} >= {cfg.max_steps}"
+            )
 
     # Quantization Config =>> only if LoRA fine-tuning
     quantization_config = None
@@ -537,20 +570,31 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
-        # Get linear module names not in backbone
-        linear_module_names = get_linear_module_names(
-            vla,
-            exclude_pattern=["vision_backbone", "projector"],
-        )
-
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules=linear_module_names,
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume:
+            adapter_config_path = adapter_dir / "adapter_config.json"
+            if not adapter_config_path.is_file():
+                raise FileNotFoundError(
+                    f"Cannot resume LoRA: adapter config not found at {adapter_config_path}"
+                )
+            vla = PeftModel.from_pretrained(
+                vla,
+                adapter_dir,
+                is_trainable=True,
+            )
+        else:
+            # Adapt language-model linear layers, not the frozen vision/projector path.
+            linear_module_names = get_linear_module_names(
+                vla,
+                exclude_pattern=["vision_backbone", "projector"],
+            )
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules=linear_module_names,
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     vla = EmbodiedDecodedSlotSSM(
@@ -589,6 +633,37 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     del slot_state_dict
 
+    if cfg.resume:
+        stage3_checkpoint_path = adapter_dir / resume_state["checkpoint_name"]
+        if not stage3_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot resume: Stage-3 checkpoint not found at {stage3_checkpoint_path}"
+            )
+        stage3_state_dict = load_file(str(stage3_checkpoint_path), device="cpu")
+        stage3_incompatible = vla.load_state_dict(stage3_state_dict, strict=False)
+        action_prefixes = (
+            "object_centric_action_slot_fusion.",
+            "object_centric_action_slot_projector.",
+            "object_centric_action_text_projector.",
+            "object_centric_action_head.",
+        )
+        missing_action_prefixes = [
+            prefix
+            for prefix in action_prefixes
+            if not any(key.startswith(prefix) for key in stage3_state_dict)
+        ]
+        if missing_action_prefixes or stage3_incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Saved Stage-3 checkpoint is incompatible. "
+                f"Missing action groups: {missing_action_prefixes}; "
+                f"unexpected keys: {stage3_incompatible.unexpected_keys[:20]}"
+            )
+        print(
+            f"Restored {len(stage3_state_dict)} Stage-3 tensors from "
+            f"{stage3_checkpoint_path}"
+        )
+        del stage3_state_dict
+
     # Stage 3 treats the object tokenizer and temporal model as a frozen
     # representation. Only newly introduced action modules and optional LoRA
     # adapters are optimized.
@@ -621,6 +696,14 @@ def finetune(cfg: FinetuneConfig) -> None:
             f"{total_count:,} ({100 * trainable_count / total_count:.3f}%)"
         )
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    completed_steps = 0
+    if cfg.resume:
+        optimizer.load_state_dict(resume_state["optimizer"])
+        completed_steps = int(resume_state["completed_steps"])
+        print(
+            f"Resuming at optimizer step {completed_steps}; "
+            "the RLDS sample stream restarts from a new iterator"
+        )
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -683,10 +766,35 @@ def finetune(cfg: FinetuneConfig) -> None:
         num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
     )
 
-    # # Initialize Logging =>> W&B
-    # if distributed_state.is_main_process:
-    #     wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}",
-    #                config={"_service_wait": 120})
+    wandb_run = None
+    wandb_run_id = (
+        resume_state.get("wandb_run_id")
+        if resume_state is not None
+        else None
+    )
+    if distributed_state.is_main_process and cfg.use_wandb:
+        wandb_config = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(cfg).items()
+        }
+        wandb_run = wandb.init(
+            entity=cfg.wandb_entity,
+            project=cfg.wandb_project,
+            name=f"slotssm-action+{exp_id}",
+            dir=str(run_dir),
+            config=wandb_config,
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id is not None else None,
+        )
+        wandb_run_id = wandb_run.id
+        wandb_run.summary["trainable_parameters"] = sum(
+            parameter.numel() for parameter in trainable_params
+        )
+        wandb_run.summary["total_parameters"] = sum(
+            parameter.numel() for parameter in vla.parameters()
+        )
+        wandb_run.summary["stage2_checkpoint"] = str(cfg.load_slot_path)
+        print(f"W&B run: {wandb_run.url}")
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
@@ -708,7 +816,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         dtype=torch.float32,
         device=device_id,
     ).view(1, 1, 1, 7)
-    completed_steps = 0
 
     def save_checkpoint(step: int) -> None:
         if not distributed_state.is_main_process:
@@ -730,9 +837,31 @@ def finetune(cfg: FinetuneConfig) -> None:
             )
         )
         save_file(object_centric_state_dict, str(checkpoint_path))
+        state_tmp_path = training_state_path.with_suffix(".pt.tmp")
+        torch.save(
+            {
+                "completed_steps": step,
+                "optimizer": optimizer.state_dict(),
+                "checkpoint_name": checkpoint_path.name,
+                "use_lora": cfg.use_lora,
+                "training_signature": training_signature,
+                "wandb_run_id": wandb_run_id,
+            },
+            state_tmp_path,
+        )
+        os.replace(state_tmp_path, training_state_path)
+        if wandb_run is not None:
+            wandb_run.summary["latest_checkpoint"] = str(checkpoint_path)
+            wandb_run.summary["latest_checkpoint_step"] = step
         print(f"Saved Stage-3 checkpoint for step {step} at {checkpoint_path}")
 
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    with tqdm.tqdm(
+        total=cfg.max_steps,
+        initial=completed_steps,
+        desc="SlotSSM-Action",
+        dynamic_ncols=True,
+        disable=not distributed_state.is_main_process,
+    ) as progress:
         vla.train()
         for frozen_module in (
             vla.module.base_model.vision_backbone,
@@ -874,22 +1003,84 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             recent_l1_losses.append(action_l1_loss.item())
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
+            next_step = completed_steps + 1
+            should_log = (
+                distributed_state.is_main_process
+                and is_optimizer_step
+                and next_step % cfg.log_steps == 0
+            )
+            grad_norm = None
+            if should_log:
+                parameter_grad_norms = [
+                    parameter.grad.detach().float().norm(2)
+                    for parameter in trainable_params
+                    if parameter.grad is not None
+                ]
+                grad_norm = (
+                    torch.linalg.vector_norm(
+                        torch.stack(parameter_grad_norms),
+                        ord=2,
+                    )
+                    if parameter_grad_norms
+                    else torch.zeros((), device=device_id)
+                )
 
             if is_optimizer_step:
                 optimizer.step()
-                optimizer.zero_grad()
                 completed_steps += 1
                 progress.update()
-                if distributed_state.is_main_process and completed_steps % 10 == 0:
-                    progress.write(
-                        str(
-                            {
-                                "step": completed_steps,
-                                "l1_loss": round(smoothened_l1_loss, 6),
-                            }
-                        )
-                    )
 
+            if should_log:
+                prediction_values = continuous_actions_pred.detach().float()
+                target_values = continuous_actions_gt.detach().float()
+                per_dimension_mae = (
+                    prediction_values - target_values
+                ).abs().mean(dim=(0, 1, 2))
+                metrics = {
+                    "train/action_l1_loss": smoothened_l1_loss,
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/grad_norm": grad_norm.item(),
+                    "actions/pred_mean": prediction_values.mean().item(),
+                    "actions/pred_std": prediction_values.std().item(),
+                    "actions/target_mean": target_values.mean().item(),
+                    "actions/target_std": target_values.std().item(),
+                    "actions/mae_x": per_dimension_mae[0].item(),
+                    "actions/mae_y": per_dimension_mae[1].item(),
+                    "actions/mae_z": per_dimension_mae[2].item(),
+                    "actions/mae_roll": per_dimension_mae[3].item(),
+                    "actions/mae_pitch": per_dimension_mae[4].item(),
+                    "actions/mae_yaw": per_dimension_mae[5].item(),
+                    "actions/mae_gripper": per_dimension_mae[6].item(),
+                    "system/gpu_allocated_gib": (
+                        torch.cuda.memory_allocated(device_id) / 2**30
+                    ),
+                    "system/gpu_reserved_gib": (
+                        torch.cuda.memory_reserved(device_id) / 2**30
+                    ),
+                    "system/gpu_peak_gib": (
+                        torch.cuda.max_memory_allocated(device_id) / 2**30
+                    ),
+                }
+                console_metrics = {
+                    "step": completed_steps,
+                    "l1": round(metrics["train/action_l1_loss"], 6),
+                    "grad_norm": round(metrics["train/grad_norm"], 4),
+                    "pred_std": round(metrics["actions/pred_std"], 4),
+                    "target_std": round(metrics["actions/target_std"], 4),
+                    "gpu_gib": round(metrics["system/gpu_allocated_gib"], 2),
+                }
+                progress.write(str(console_metrics))
+                progress.set_postfix(
+                    loss=f"{metrics['train/action_l1_loss']:.4f}",
+                    grad=f"{metrics['train/grad_norm']:.3f}",
+                    gpu=f"{metrics['system/gpu_allocated_gib']:.1f}G",
+                )
+                if wandb_run is not None:
+                    wandb_run.log(metrics, step=completed_steps)
+                torch.cuda.reset_peak_memory_stats(device_id)
+
+            if is_optimizer_step:
+                optimizer.zero_grad()
                 should_save = (
                     completed_steps % cfg.save_steps == 0
                     or completed_steps >= cfg.max_steps
@@ -900,6 +1091,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 if completed_steps >= cfg.max_steps:
                     break
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

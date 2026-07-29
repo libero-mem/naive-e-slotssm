@@ -26,6 +26,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --use_lora False \
     --use_quantization False
 
+
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --standalone \
     --nnodes 1 \
@@ -51,5 +52,13 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --train_rotation False \
     --image_aug True \
     --modality_key 1000 \
-    --use_lora False \
-    --use_quantization False
+    --use_lora True \
+    --lora_rank 32 \
+    --lora_dropout 0.0 \
+    --use_quantization False \
+    --save_latest_checkpoint_only True \
+    --use_wandb True \
+    --wandb_entity nhat \
+    --wandb_project libero-mem \
+    --log_steps 10 \
+    --resume False
