@@ -686,7 +686,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         device_ids=[device_id],
         find_unused_parameters=True,
         gradient_as_bucket_view=True,
-        static_graph=True,
     )
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
