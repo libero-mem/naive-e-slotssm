@@ -89,7 +89,7 @@ Notes:
 - Temporal context comes from horizon windows, not explicit temporal labels.
 """
 
-from __future__ import annotations
+#from __future__ import annotations
 
 import gc
 import os

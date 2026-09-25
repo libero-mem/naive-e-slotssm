@@ -26,7 +26,7 @@ This repository builds on an OpenVLA backbone and organizes training into three 
 
 | Stage | Objective | Input checkpoint | Output checkpoint |
 | --- | --- | --- | --- |
-| 🧩 1. Slot learning | Learn object slots, masks, boxes, objectness, and interactability | Initial slot weights | `pretrained_slots-wo-filters_s16.safetensors` |
+| 🧩 1. Slot learning | Learn object slots, masks, boxes, and objectness | Optional initial slot weights | `pretrained_slots-wo-filters_s16.safetensors` |
 | ⏳ 2. Temporal pretraining | Reconstruct past slots and forecast future slots with SlotSSM | Stage 1 | `object_centric_bwd25_fwd6.safetensors` |
 | 🦾 3. Action prediction | Decode continuous actions from language-conditioned slot memory | Stage 2 | `object_centric_bwd25+fwd6_actionable.safetensors` |
 
@@ -238,6 +238,10 @@ batch_size × grad_accumulation_steps × number_of_processes
 | `1111` | All four modalities |
 
 Keep the value quoted if a shell or configuration layer might interpret leading zeroes.
+
+Stage 1's current `SlotAtt` training path consumes main RGB only and therefore
+requires `--modality_key 1000`. Other modality combinations are reserved for
+training paths that explicitly fuse those tensors.
 
 ## ⚠️ Known limitations
 
