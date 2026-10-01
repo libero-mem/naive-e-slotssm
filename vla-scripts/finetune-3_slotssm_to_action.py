@@ -299,6 +299,7 @@ class FinetuneConfig:
     train_rotation: bool = False                                  # Include xyz rotation dimensions in the action loss
     action_loss_start_step: int = 16                              # Ignore early horizon steps with little temporal context
     subgoal_state_loss_weight: float = 1.0                         # Train predicted per-slot subgoal embeddings
+    oracle_subgoal_warmup_steps: int = 2000                       # Linearly replace oracle states with predictions
 
 MODALITIES = ['rgb_main', 'rgb_wrist', 'depth_main', 'depth_wrist']
 def process_modality_key(modality_key):
@@ -968,7 +969,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                 oracle_subgoal_states,
                 matching_indices,
             )
-            subgoal_states = predicted_subgoal_states
+            oracle_fraction = max(
+                0.0,
+                1.0 - completed_steps / max(cfg.oracle_subgoal_warmup_steps, 1),
+            )
+            subgoal_states = (
+                oracle_fraction * oracle_subgoal_states.detach()
+                + (1.0 - oracle_fraction) * predicted_subgoal_states
+            )
 
             input_ids = batch["input_ids"].to(device_id, non_blocking=True)
             attention_mask = batch["attention_mask"].to(
@@ -1072,6 +1080,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     "train/total_loss": smoothened_l1_loss,
                     "train/action_l1_loss": action_l1_loss.item(),
                     "train/subgoal_state_loss": subgoal_loss.item(),
+                    "train/oracle_subgoal_fraction": oracle_fraction,
+                    "train/subgoal_gate": vla.module.object_centric_subgoal_gate.item(),
                     "train/learning_rate": optimizer.param_groups[0]["lr"],
                     "train/grad_norm": grad_norm.item(),
                     "actions/pred_mean": prediction_values.mean().item(),
