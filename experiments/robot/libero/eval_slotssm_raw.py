@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from peft import PeftModel
 from safetensors.torch import load_file
+from scipy.optimize import linear_sum_assignment
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
 
@@ -161,7 +162,7 @@ def predict_action(model, batch, pixel_history, binder, task_text):
             llama_attention_mask=batch["attention_mask"].to(device),
             action_start_step=pixel_values.shape[1] - 1,
         )
-    return action_chunk[0, 0, 0].float().cpu().numpy()
+    return action_chunk[0, 0, 0].float().cpu().numpy(), object_outputs
 
 
 def denormalize_actions(model, unnorm_key, normalized_actions):
@@ -170,6 +171,61 @@ def denormalize_actions(model, unnorm_key, normalized_actions):
     low = np.asarray(stats["q01"])
     high = np.asarray(stats["q99"])
     return np.where(mask, 0.5 * (normalized_actions + 1) * (high - low) + low, normalized_actions)
+
+
+def grounding_step_metrics(predicted_boxes, gt_objects, previous_assignments, metrics):
+    predicted_boxes = predicted_boxes.detach().float().cpu().numpy()
+    gt_labels = list(gt_objects)
+    gt_boxes = np.asarray([gt_objects[label][1] for label in gt_labels], dtype=np.float32)
+    gt_boxes = np.column_stack(
+        [gt_boxes[:, 0] + gt_boxes[:, 2] / 2, gt_boxes[:, 1] + gt_boxes[:, 3] / 2, gt_boxes[:, 2:]]
+    )
+    candidate_indices = np.flatnonzero(predicted_boxes[:, 4] >= 0.5)
+    if not len(candidate_indices):
+        metrics["ground_truth_objects"] += len(gt_labels)
+        metrics["false_negatives"] += len(gt_labels)
+        return previous_assignments
+    candidate_boxes = predicted_boxes[candidate_indices, :4]
+    pred_xyxy = np.column_stack(
+        [
+            candidate_boxes[:, 0] - candidate_boxes[:, 2] / 2,
+            candidate_boxes[:, 1] - candidate_boxes[:, 3] / 2,
+            candidate_boxes[:, 0] + candidate_boxes[:, 2] / 2,
+            candidate_boxes[:, 1] + candidate_boxes[:, 3] / 2,
+        ]
+    )
+    gt_xyxy = np.column_stack(
+        [
+            gt_boxes[:, 0] - gt_boxes[:, 2] / 2,
+            gt_boxes[:, 1] - gt_boxes[:, 3] / 2,
+            gt_boxes[:, 0] + gt_boxes[:, 2] / 2,
+            gt_boxes[:, 1] + gt_boxes[:, 3] / 2,
+        ]
+    )
+    top_left = np.maximum(pred_xyxy[:, None, :2], gt_xyxy[None, :, :2])
+    bottom_right = np.minimum(pred_xyxy[:, None, 2:], gt_xyxy[None, :, 2:])
+    intersection_wh = np.maximum(bottom_right - top_left, 0)
+    intersection = intersection_wh[..., 0] * intersection_wh[..., 1]
+    pred_area = np.prod(np.maximum(pred_xyxy[:, 2:] - pred_xyxy[:, :2], 0), axis=1)
+    gt_area = np.prod(np.maximum(gt_xyxy[:, 2:] - gt_xyxy[:, :2], 0), axis=1)
+    ious = intersection / np.maximum(pred_area[:, None] + gt_area[None, :] - intersection, 1e-8)
+    row_indices, col_indices = linear_sum_assignment(1.0 - ious)
+    matched = [(r, c, ious[r, c]) for r, c in zip(row_indices, col_indices) if ious[r, c] >= 0.5]
+    matched_slots = {candidate_indices[r] for r, _, _ in matched}
+    metrics["ground_truth_objects"] += len(gt_labels)
+    metrics["true_positives"] += len(matched)
+    metrics["false_positives"] += len(candidate_indices) - len(matched_slots)
+    metrics["false_negatives"] += len(gt_labels) - len(matched)
+    metrics["matched_iou_sum"] += sum(iou for _, _, iou in matched)
+    current_assignments = {}
+    for row, col, _ in matched:
+        label = gt_labels[col]
+        slot_index = int(candidate_indices[row])
+        current_assignments[label] = slot_index
+        if label in previous_assignments:
+            metrics["tracking_transitions"] += 1
+            metrics["tracking_id_switches"] += int(previous_assignments[label] != slot_index)
+    return current_assignments
 
 
 def parse_args():
@@ -208,6 +264,7 @@ def parse_args():
         default=Path("/mnt/data/data_nhat/LIBERO-Mem/evaluation/slotssm-raw-unseen"),
     )
     parser.add_argument("--save_videos", action="store_true")
+    parser.add_argument("--grounding_metrics", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--number_of_slots", type=int, default=16)
@@ -274,7 +331,9 @@ def main():
         )
 
         for demo_key, initial_state, _ in episodes:
-            if demo_key in task_results:
+            if demo_key in task_results and (
+                not args.grounding_metrics or "grounding" in task_results[demo_key]
+            ):
                 continue
             env.reset()
             rollout_tools.set_init_state(env, initial_state)
@@ -293,6 +352,16 @@ def main():
                 model.object_centric_text_encoder,
                 count_embeddings,
             )
+            grounding = {
+                "ground_truth_objects": 0,
+                "true_positives": 0,
+                "false_positives": 0,
+                "false_negatives": 0,
+                "matched_iou_sum": 0.0,
+                "tracking_transitions": 0,
+                "tracking_id_switches": 0,
+            }
+            previous_assignments = {}
             update_tracker(
                 recorder,
                 env,
@@ -310,9 +379,16 @@ def main():
 
             for _ in range(max_steps):
                 replay_images.append(image)
-                normalized_action = predict_action(
+                normalized_action, object_outputs = predict_action(
                     model, batch, pixel_history, binder, model_task_text
                 )
+                if args.grounding_metrics:
+                    previous_assignments = grounding_step_metrics(
+                        object_outputs["bboxes"][0, -1],
+                        recorder.agentview_boxes[-1],
+                        previous_assignments,
+                        grounding,
+                    )
                 action = denormalize_actions(model, "libero_mem", normalized_action)
                 action[3:6] = 0.0
                 obs, _, done, _ = env.step(action.tolist())
@@ -340,6 +416,16 @@ def main():
                 "tiered_success": len(satisfied) / goal_length,
                 "unseen_state_labels": sorted(binder.unseen_state_labels),
             }
+            if args.grounding_metrics:
+                detections = grounding["true_positives"] + grounding["false_positives"]
+                task_results[demo_key]["grounding"] = {
+                    "precision": grounding["true_positives"] / max(detections, 1),
+                    "recall": grounding["true_positives"] / max(grounding["ground_truth_objects"], 1),
+                    "mean_iou": grounding["matched_iou_sum"] / max(grounding["true_positives"], 1),
+                    "tracking_id_switches": grounding["tracking_id_switches"],
+                    "tracking_transitions": grounding["tracking_transitions"],
+                    "tracking_id_switch_rate": grounding["tracking_id_switches"] / max(grounding["tracking_transitions"], 1),
+                }
             if args.save_videos:
                 rollout_tools.save_rollout_video(
                     replay_images,
