@@ -442,15 +442,17 @@ def main():
                     )
                     if "nxt_tokens" in object_outputs:
                         horizon_boxes = model.object_centric_bbox_head(
-                            object_outputs["nxt_tokens"][0, -1].detach()
+                            object_outputs["nxt_tokens"][0, -1]
+                            .detach()
+                            .to(dtype=next(model.object_centric_bbox_head.parameters()).dtype)
                         ).sigmoid()
-                        backward_boxes = horizon_boxes[: args.bwd_steps]
-                        forward_boxes = horizon_boxes[args.bwd_steps :]
+                        backward_boxes = horizon_boxes[:, : args.bwd_steps]
+                        forward_boxes = horizon_boxes[:, args.bwd_steps :]
                         grounding["backward_min_iou_sum"] += min(
-                            matched_mean_iou(boxes, current_objects) for boxes in backward_boxes
+                            matched_mean_iou(boxes, current_objects) for boxes in backward_boxes.transpose(0, 1)
                         )
                         grounding["forward_max_iou_sum"] += max(
-                            (matched_mean_iou(boxes, current_objects) for boxes in forward_boxes),
+                            (matched_mean_iou(boxes, current_objects) for boxes in forward_boxes.transpose(0, 1)),
                             default=0.0,
                         )
                         grounding["dynamics_frames"] += 1
