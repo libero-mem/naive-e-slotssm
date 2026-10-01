@@ -298,6 +298,7 @@ class FinetuneConfig:
     debug: bool = False                                           # Whether to use debug mode
     train_rotation: bool = False                                  # Include xyz rotation dimensions in the action loss
     action_loss_start_step: int = 16                              # Ignore early horizon steps with little temporal context
+    subgoal_state_loss_weight: float = 1.0                         # Train predicted per-slot subgoal embeddings
 
 MODALITIES = ['rgb_main', 'rgb_wrist', 'depth_main', 'depth_wrist']
 def process_modality_key(modality_key):
@@ -424,6 +425,22 @@ def get_slot_specific_subgoals(
     subgoal_states = torch.stack(subgoal_states)
     subgoal_states = subgoal_states.permute([0, 2, 1, 3]) # 'b o t d -> b t o d'
     return subgoal_states, indices
+
+
+def subgoal_state_loss(predicted_states, target_states, indices):
+    """Dense per-frame state loss on slots matched by the training boxes."""
+    losses = []
+    for batch_index, (source_indices, _) in enumerate(indices):
+        if source_indices.numel() == 0:
+            continue
+        predicted = predicted_states[batch_index, :, source_indices]
+        target = target_states[batch_index, :, source_indices].detach()
+        predicted = F.normalize(predicted.float(), dim=-1)
+        target = F.normalize(target.float(), dim=-1)
+        losses.append(1.0 - F.cosine_similarity(predicted, target, dim=-1).mean())
+    if not losses:
+        return predicted_states.sum() * 0.0
+    return torch.stack(losses).mean()
 
 
 import gc
@@ -922,7 +939,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     batch_vision_backbone=True,
                     compute_masks=False,
                 )
-                subgoal_states, _ = get_slot_specific_subgoals(
+                oracle_subgoal_states, matching_indices = get_slot_specific_subgoals(
                     object_outputs,
                     vla.module.object_token_num,
                     horizon,
@@ -942,6 +959,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                         "texts_attn",
                     )
                 }
+
+            predicted_subgoal_states = vla.module.predict_subgoal_states(
+                object_outputs["visual_tokens"].detach()
+            )
+            subgoal_loss = subgoal_state_loss(
+                predicted_subgoal_states,
+                oracle_subgoal_states,
+                matching_indices,
+            )
+            subgoal_states = predicted_subgoal_states
 
             input_ids = batch["input_ids"].to(device_id, non_blocking=True)
             attention_mask = batch["attention_mask"].to(
@@ -1000,12 +1027,13 @@ def finetune(cfg: FinetuneConfig) -> None:
                         * action_dimension_mask.sum()
                     )
                     action_l1_loss = absolute_error.sum() / denominator
+                    total_loss = action_l1_loss + cfg.subgoal_state_loss_weight * subgoal_loss
                     normalized_loss = (
-                        action_l1_loss / cfg.grad_accumulation_steps
+                        total_loss / cfg.grad_accumulation_steps
                     )
                 normalized_loss.backward()
 
-            recent_l1_losses.append(action_l1_loss.item())
+            recent_l1_losses.append(total_loss.item())
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
             next_step = completed_steps + 1
             should_log = (
@@ -1041,7 +1069,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                     prediction_values - target_values
                 ).abs().mean(dim=(0, 1, 2))
                 metrics = {
-                    "train/action_l1_loss": smoothened_l1_loss,
+                    "train/total_loss": smoothened_l1_loss,
+                    "train/action_l1_loss": action_l1_loss.item(),
+                    "train/subgoal_state_loss": subgoal_loss.item(),
                     "train/learning_rate": optimizer.param_groups[0]["lr"],
                     "train/grad_norm": grad_norm.item(),
                     "actions/pred_mean": prediction_values.mean().item(),

@@ -3123,6 +3123,7 @@ class OpenVLAForActionPrediction_SlotSSM(nn.Module):
         # dim 256: 0.7546
         self.object_centric_tokenizer = SlotAttention(n_slots=self.object_token_num, in_dim=2176, feature_dim=512) 
         self.object_centric_bbox_head = MLP(input_dim=512, hidden_dim=1024, output_dim=5, num_layers=2) # switch depth to 3 for good results
+        self.object_centric_subgoal_head = MLP(input_dim=512, hidden_dim=1024, output_dim=512, num_layers=2)
         self.object_centric_mask_head = MaskPredictionHead(slot_dim=512, hidden_dim=1024, mask_size=(64,64))
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32")
         self.object_centric_text_encoder = CLIPBasedTextEncoder(self.clip_model, self.clip_preprocess)
@@ -3412,6 +3413,10 @@ class EmbodiedDecodedSlotSSM(OpenVLAForActionPrediction_SlotSSM):
         return self.object_centric_action_slot_fusion(
             [current_slots, latent_slots, subgoal_states]
         )
+
+    def predict_subgoal_states(self, visual_tokens: torch.Tensor) -> torch.Tensor:
+        """Predict per-slot subgoal embeddings from visual slot tokens."""
+        return F.normalize(self.object_centric_subgoal_head(visual_tokens), dim=-1)
 
     def decode_continuous_actions(
         self,
