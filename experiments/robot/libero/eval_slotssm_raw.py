@@ -208,6 +208,7 @@ def parse_args():
         default=Path("/mnt/data/data_nhat/LIBERO-Mem/evaluation/slotssm-raw-unseen"),
     )
     parser.add_argument("--save_videos", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--number_of_slots", type=int, default=16)
     parser.add_argument("--bwd_steps", type=int, default=25)
@@ -246,7 +247,11 @@ def main():
     object_loss = RobotSSMObjectLossWithTrack(seg_required=False)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results_path = args.output_dir / f"results_{args.eval_mode}.json"
-    results = {}
+    if args.resume and results_path.exists():
+        with results_path.open() as results_file:
+            results = json.load(results_file).get("task_results", {})
+    else:
+        results = {}
     horizon = args.bwd_steps + args.fwd_steps + 1
 
     for task_id in task_ids:
@@ -262,13 +267,15 @@ def main():
         )
         env, _ = rollout_tools.get_libero_env(task, "llava", resolution=256)
         goal_length = env.get_goal_sequence_len()
-        task_results = {}
+        task_results = results.get(task.name, {})
         max_steps = args.max_steps or max(
             rollout_tools.TASK_LENGTHS.get(model_task_text.lower(), 0),
             max(length for _, _, length in episodes),
         )
 
         for demo_key, initial_state, _ in episodes:
+            if demo_key in task_results:
+                continue
             env.reset()
             rollout_tools.set_init_state(env, initial_state)
             env.reset_subgoal_progress()
