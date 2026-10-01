@@ -3522,6 +3522,7 @@ class EmbodiedDecodedSlotSSM(OpenVLAForActionPrediction_SlotSSM):
         llama_input_ids: torch.LongTensor,
         llama_attention_mask: torch.Tensor,
         action_start_step: int = 0,
+        return_object_dynamics: bool = False,
     ) -> torch.Tensor:
         outputs = self.get_slot_dynamics(
             object_outputs["visual_tokens"],
@@ -3531,7 +3532,7 @@ class EmbodiedDecodedSlotSSM(OpenVLAForActionPrediction_SlotSSM):
             object_outputs["texts_attn"],
             object_outputs,
             redundant_steps=0,
-            nohead=True,
+            nohead=not return_object_dynamics,
         )
         slotted_features = self.get_slot_fusion(
             outputs["visual_tokens"],

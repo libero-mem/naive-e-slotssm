@@ -144,7 +144,7 @@ def update_tracker(recorder, env, obs, action, task_description, rollout_tools, 
     binder.update(recorder)
 
 
-def predict_action(model, batch, pixel_history, binder, task_text):
+def predict_action(model, batch, pixel_history, binder, task_text, return_object_dynamics=False):
     device = batch["input_ids"].device
     pixel_values = torch.stack([frame[0] for frame in pixel_history]).unsqueeze(0)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -161,6 +161,7 @@ def predict_action(model, batch, pixel_history, binder, task_text):
             llama_input_ids=batch["input_ids"].to(device),
             llama_attention_mask=batch["attention_mask"].to(device),
             action_start_step=pixel_values.shape[1] - 1,
+            return_object_dynamics=return_object_dynamics,
         )
     return action_chunk[0, 0, 0].float().cpu().numpy(), object_outputs
 
@@ -226,6 +227,46 @@ def grounding_step_metrics(predicted_boxes, gt_objects, previous_assignments, me
             metrics["tracking_transitions"] += 1
             metrics["tracking_id_switches"] += int(previous_assignments[label] != slot_index)
     return current_assignments
+
+
+def matched_mean_iou(predicted_boxes, gt_objects):
+    predicted_boxes = predicted_boxes.detach().float().cpu().numpy()
+    gt_labels = list(gt_objects)
+    if not gt_labels:
+        return 0.0
+    gt_boxes = np.asarray([gt_objects[label][1] for label in gt_labels], dtype=np.float32)
+    gt_boxes = np.column_stack(
+        [gt_boxes[:, 0] + gt_boxes[:, 2] / 2, gt_boxes[:, 1] + gt_boxes[:, 3] / 2, gt_boxes[:, 2:]]
+    )
+    predicted_boxes = predicted_boxes[predicted_boxes[:, 4] >= 0.5, :4]
+    if not len(predicted_boxes):
+        return 0.0
+    pred_xyxy = np.column_stack(
+        [
+            predicted_boxes[:, 0] - predicted_boxes[:, 2] / 2,
+            predicted_boxes[:, 1] - predicted_boxes[:, 3] / 2,
+            predicted_boxes[:, 0] + predicted_boxes[:, 2] / 2,
+            predicted_boxes[:, 1] + predicted_boxes[:, 3] / 2,
+        ]
+    )
+    gt_xyxy = np.column_stack(
+        [
+            gt_boxes[:, 0] - gt_boxes[:, 2] / 2,
+            gt_boxes[:, 1] - gt_boxes[:, 3] / 2,
+            gt_boxes[:, 0] + gt_boxes[:, 2] / 2,
+            gt_boxes[:, 1] + gt_boxes[:, 3] / 2,
+        ]
+    )
+    top_left = np.maximum(pred_xyxy[:, None, :2], gt_xyxy[None, :, :2])
+    bottom_right = np.minimum(pred_xyxy[:, None, 2:], gt_xyxy[None, :, 2:])
+    intersection_wh = np.maximum(bottom_right - top_left, 0)
+    intersection = intersection_wh[..., 0] * intersection_wh[..., 1]
+    pred_area = np.prod(np.maximum(pred_xyxy[:, 2:] - pred_xyxy[:, :2], 0), axis=1)
+    gt_area = np.prod(np.maximum(gt_xyxy[:, 2:] - gt_xyxy[:, :2], 0), axis=1)
+    ious = intersection / np.maximum(pred_area[:, None] + gt_area[None, :] - intersection, 1e-8)
+    rows, columns = linear_sum_assignment(1.0 - ious)
+    matched_ious = [ious[row, column] for row, column in zip(rows, columns) if ious[row, column] >= 0.5]
+    return float(np.mean(matched_ious)) if matched_ious else 0.0
 
 
 def parse_args():
@@ -332,7 +373,8 @@ def main():
 
         for demo_key, initial_state, _ in episodes:
             if demo_key in task_results and (
-                not args.grounding_metrics or "grounding" in task_results[demo_key]
+                not args.grounding_metrics
+                or "max_forward_prediction_iou" in task_results[demo_key].get("grounding", {})
             ):
                 continue
             env.reset()
@@ -360,6 +402,9 @@ def main():
                 "matched_iou_sum": 0.0,
                 "tracking_transitions": 0,
                 "tracking_id_switches": 0,
+                "backward_min_iou_sum": 0.0,
+                "forward_max_iou_sum": 0.0,
+                "dynamics_frames": 0,
             }
             previous_assignments = {}
             update_tracker(
@@ -380,15 +425,35 @@ def main():
             for _ in range(max_steps):
                 replay_images.append(image)
                 normalized_action, object_outputs = predict_action(
-                    model, batch, pixel_history, binder, model_task_text
+                    model,
+                    batch,
+                    pixel_history,
+                    binder,
+                    model_task_text,
+                    return_object_dynamics=args.grounding_metrics,
                 )
                 if args.grounding_metrics:
+                    current_objects = recorder.agentview_boxes[-1]
                     previous_assignments = grounding_step_metrics(
                         object_outputs["bboxes"][0, -1],
-                        recorder.agentview_boxes[-1],
+                        current_objects,
                         previous_assignments,
                         grounding,
                     )
+                    if "nxt_tokens" in object_outputs:
+                        horizon_boxes = model.object_centric_bbox_head(
+                            object_outputs["nxt_tokens"][0, -1].detach()
+                        ).sigmoid()
+                        backward_boxes = horizon_boxes[: args.bwd_steps]
+                        forward_boxes = horizon_boxes[args.bwd_steps :]
+                        grounding["backward_min_iou_sum"] += min(
+                            matched_mean_iou(boxes, current_objects) for boxes in backward_boxes
+                        )
+                        grounding["forward_max_iou_sum"] += max(
+                            (matched_mean_iou(boxes, current_objects) for boxes in forward_boxes),
+                            default=0.0,
+                        )
+                        grounding["dynamics_frames"] += 1
                 action = denormalize_actions(model, "libero_mem", normalized_action)
                 action[3:6] = 0.0
                 obs, _, done, _ = env.step(action.tolist())
@@ -422,6 +487,9 @@ def main():
                     "precision": grounding["true_positives"] / max(detections, 1),
                     "recall": grounding["true_positives"] / max(grounding["ground_truth_objects"], 1),
                     "mean_iou": grounding["matched_iou_sum"] / max(grounding["true_positives"], 1),
+                    "current_position_mean_iou": grounding["matched_iou_sum"] / max(grounding["true_positives"], 1),
+                    "min_backward_prediction_iou": grounding["backward_min_iou_sum"] / max(grounding["dynamics_frames"], 1),
+                    "max_forward_prediction_iou": grounding["forward_max_iou_sum"] / max(grounding["dynamics_frames"], 1),
                     "tracking_id_switches": grounding["tracking_id_switches"],
                     "tracking_transitions": grounding["tracking_transitions"],
                     "tracking_id_switch_rate": grounding["tracking_id_switches"] / max(grounding["tracking_transitions"], 1),
